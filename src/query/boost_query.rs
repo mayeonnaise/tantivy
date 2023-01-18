@@ -21,10 +21,12 @@ impl BoostQuery {
         BoostQuery { query, boost }
     }
 
+    /// Returns a copy of the Boost factor of the query
     pub fn boost(&self) -> Score {
         self.boost
     }
 
+    /// Returns a copy of the underlying query
     pub fn query(&self) -> Box<dyn Query> {
         self.query.box_clone()
     }
