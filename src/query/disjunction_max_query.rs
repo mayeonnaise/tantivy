@@ -127,4 +127,9 @@ impl DisjunctionMaxQuery {
     pub fn new(disjuncts: Vec<Box<dyn Query>>) -> DisjunctionMaxQuery {
         DisjunctionMaxQuery::with_tie_breaker(disjuncts, 0.0)
     }
+
+    /// Returns a reference to the vector of disjunct
+    pub fn disjuncts(&self) -> &Vec<Box<dyn Query>> {
+        &self.disjuncts
+    }
 }
