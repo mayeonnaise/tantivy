@@ -1,11 +1,12 @@
 use std::io;
 use std::io::Write;
 
-use common::CountingWriter;
+use common::{BinarySerializable, CountingWriter};
 use sstable::value::RangeValueWriter;
 use sstable::RangeSSTable;
 
 use crate::columnar::ColumnType;
+use crate::RowId;
 
 pub struct ColumnarSerializer<W: io::Write> {
     wrt: CountingWriter<W>,
@@ -33,11 +34,12 @@ impl<W: io::Write> ColumnarSerializer<W> {
         }
     }
 
-    pub fn serialize_column<'a>(
+    /// Creates a ColumnSerializer.
+    pub fn start_serialize_column<'a>(
         &'a mut self,
         column_name: &[u8],
         column_type: ColumnType,
-    ) -> impl io::Write + 'a {
+    ) -> ColumnSerializer<'a, W> {
         let start_offset = self.wrt.written_bytes();
         prepare_key(column_name, column_type, &mut self.prepare_key_buffer);
         ColumnSerializer {
@@ -46,11 +48,12 @@ impl<W: io::Write> ColumnarSerializer<W> {
         }
     }
 
-    pub(crate) fn finalize(mut self) -> io::Result<()> {
+    pub(crate) fn finalize(mut self, num_rows: RowId) -> io::Result<()> {
         let sstable_bytes: Vec<u8> = self.sstable_range.finish()?;
         let sstable_num_bytes: u64 = sstable_bytes.len() as u64;
         self.wrt.write_all(&sstable_bytes)?;
         self.wrt.write_all(&sstable_num_bytes.to_le_bytes()[..])?;
+        num_rows.serialize(&mut self.wrt)?;
         self.wrt
             .write_all(&super::super::format_version::footer())?;
         self.wrt.flush()?;
@@ -58,20 +61,21 @@ impl<W: io::Write> ColumnarSerializer<W> {
     }
 }
 
-struct ColumnSerializer<'a, W: io::Write> {
+pub struct ColumnSerializer<'a, W: io::Write> {
     columnar_serializer: &'a mut ColumnarSerializer<W>,
     start_offset: u64,
 }
 
-impl<'a, W: io::Write> Drop for ColumnSerializer<'a, W> {
-    fn drop(&mut self) {
+impl<'a, W: io::Write> ColumnSerializer<'a, W> {
+    pub fn finalize(self) -> io::Result<()> {
         let end_offset: u64 = self.columnar_serializer.wrt.written_bytes();
         let byte_range = self.start_offset..end_offset;
-        self.columnar_serializer.sstable_range.insert_cannot_fail(
+        self.columnar_serializer.sstable_range.insert(
             &self.columnar_serializer.prepare_key_buffer[..],
             &byte_range,
-        );
+        )?;
         self.columnar_serializer.prepare_key_buffer.clear();
+        Ok(())
     }
 }
 
@@ -97,10 +101,10 @@ mod tests {
     #[test]
     fn test_prepare_key_bytes() {
         let mut buffer: Vec<u8> = b"somegarbage".to_vec();
-        prepare_key(b"root\0child", ColumnType::Bytes, &mut buffer);
+        prepare_key(b"root\0child", ColumnType::Str, &mut buffer);
         assert_eq!(buffer.len(), 12);
         assert_eq!(&buffer[..10], b"root\0child");
         assert_eq!(buffer[10], 0u8);
-        assert_eq!(buffer[11], ColumnType::Bytes.to_code());
+        assert_eq!(buffer[11], ColumnType::Str.to_code());
     }
 }

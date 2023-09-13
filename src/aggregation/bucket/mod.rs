@@ -1,48 +1,60 @@
 //! Module for all bucket aggregations.
 //!
-//! BucketAggregations create buckets of documents
-//! [`BucketAggregation`](super::agg_req::BucketAggregation).
+//! BucketAggregations create buckets of documents.
+//! Each bucket is associated with a rule which
+//! determines whether or not a document in the falls into it. In other words, the buckets
+//! effectively define document sets. Buckets are not necessarily disjunct, therefore a document can
+//! fall into multiple buckets. In addition to the buckets themselves, the bucket aggregations also
+//! compute and return the number of documents for each bucket. Bucket aggregations, as opposed to
+//! metric aggregations, can hold sub-aggregations. These sub-aggregations will be aggregated for
+//! the buckets created by their "parent" bucket aggregation. There are different bucket
+//! aggregators, each with a different "bucketing" strategy. Some define a single bucket, some
+//! define fixed number of multiple buckets, and others dynamically create the buckets during the
+//! aggregation process.
 //!
 //! Results of final buckets are [`BucketResult`](super::agg_result::BucketResult).
 //! Results of intermediate buckets are
 //! [`IntermediateBucketResult`](super::intermediate_agg_result::IntermediateBucketResult)
+//!
+//! ## Supported Bucket Aggregations
+//! - [Histogram](HistogramAggregation)
+//! - [DateHistogram](DateHistogramAggregationReq)
+//! - [Range](RangeAggregation)
+//! - [Terms](TermsAggregation)
 
 mod histogram;
 mod range;
 mod term_agg;
+mod term_missing_agg;
 
 use std::collections::HashMap;
 
-pub(crate) use histogram::SegmentHistogramCollector;
 pub use histogram::*;
-pub(crate) use range::SegmentRangeCollector;
 pub use range::*;
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 pub use term_agg::*;
+pub use term_missing_agg::*;
 
 /// Order for buckets in a bucket aggregation.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, Default)]
 pub enum Order {
     /// Asc order
     #[serde(rename = "asc")]
     Asc,
     /// Desc order
     #[serde(rename = "desc")]
+    #[default]
     Desc,
-}
-
-impl Default for Order {
-    fn default() -> Self {
-        Order::Desc
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 /// Order property by which to apply the order
+#[derive(Default)]
 pub enum OrderTarget {
     /// The key of the bucket
     Key,
     /// The doc count of the bucket
+    #[default]
     Count,
     /// Order by value of the sub aggregation metric with identified by given `String`.
     ///
@@ -50,11 +62,6 @@ pub enum OrderTarget {
     SubAggregation(String),
 }
 
-impl Default for OrderTarget {
-    fn default() -> Self {
-        OrderTarget::Count
-    }
-}
 impl From<&str> for OrderTarget {
     fn from(val: &str) -> Self {
         match val {

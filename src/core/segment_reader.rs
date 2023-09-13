@@ -2,14 +2,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::{fmt, io};
 
-use fail::fail_point;
-
 use crate::core::{InvertedIndexReader, Segment, SegmentComponent, SegmentId};
 use crate::directory::{CompositeFile, FileSlice};
 use crate::error::DataCorruption;
 use crate::fastfield::{intersect_alive_bitsets, AliveBitSet, FacetReader, FastFieldReaders};
 use crate::fieldnorm::{FieldNormReader, FieldNormReaders};
-use crate::schema::{Field, FieldType, IndexRecordOption, Schema};
+use crate::schema::{Field, IndexRecordOption, Schema, Type};
 use crate::space_usage::SegmentSpaceUsage;
 use crate::store::StoreReader;
 use crate::termdict::TermDictionary;
@@ -38,7 +36,7 @@ pub struct SegmentReader {
     termdict_composite: CompositeFile,
     postings_composite: CompositeFile,
     positions_composite: CompositeFile,
-    fast_fields_readers: Arc<FastFieldReaders>,
+    fast_fields_readers: FastFieldReaders,
     fieldnorm_readers: FieldNormReaders,
 
     store_file: FileSlice,
@@ -90,25 +88,19 @@ impl SegmentReader {
     }
 
     /// Accessor to the `FacetReader` associated with a given `Field`.
-    pub fn facet_reader(&self, field: Field) -> crate::Result<FacetReader> {
-        let field_entry = self.schema.get_field_entry(field);
-
-        match field_entry.field_type() {
-            FieldType::Facet(_) => {
-                let term_ords_reader =
-                    self.fast_fields().u64s(self.schema.get_field_name(field))?;
-                let termdict = self
-                    .termdict_composite
-                    .open_read(field)
-                    .map(TermDictionary::open)
-                    .unwrap_or_else(|| Ok(TermDictionary::empty()))?;
-                Ok(FacetReader::new(term_ords_reader, termdict))
-            }
-            _ => Err(crate::TantivyError::InvalidArgument(format!(
-                "Field {:?} is not a facet field.",
-                field_entry.name()
-            ))),
+    pub fn facet_reader(&self, field_name: &str) -> crate::Result<FacetReader> {
+        let schema = self.schema();
+        let field = schema.get_field(field_name)?;
+        let field_entry = schema.get_field_entry(field);
+        if field_entry.field_type().value_type() != Type::Facet {
+            return Err(crate::TantivyError::SchemaError(format!(
+                "`{field_name}` is not a facet field.`"
+            )));
         }
+        let Some(facet_column) = self.fast_fields().str(field_name)? else {
+            panic!("Facet Field `{field_name}` is missing. This should not happen");
+        };
+        Ok(FacetReader::new(facet_column))
     }
 
     /// Accessor to the segment's `Field norms`'s reader.
@@ -134,9 +126,12 @@ impl SegmentReader {
         &self.fieldnorm_readers
     }
 
-    /// Accessor to the segment's `StoreReader`.
-    pub fn get_store_reader(&self, cache_size: usize) -> io::Result<StoreReader> {
-        StoreReader::open(self.store_file.clone(), cache_size)
+    /// Accessor to the segment's [`StoreReader`](crate::store::StoreReader).
+    ///
+    /// `cache_num_blocks` sets the number of decompressed blocks to be cached in an LRU.
+    /// The size of blocks is configurable, this should be reflexted in the
+    pub fn get_store_reader(&self, cache_num_blocks: usize) -> io::Result<StoreReader> {
+        StoreReader::open(self.store_file.clone(), cache_num_blocks)
     }
 
     /// Open a new segment for reading.
@@ -154,7 +149,7 @@ impl SegmentReader {
 
         let store_file = segment.open_read(SegmentComponent::Store)?;
 
-        fail_point!("SegmentReader::open#middle");
+        crate::fail_point!("SegmentReader::open#middle");
 
         let postings_file = segment.open_read(SegmentComponent::Postings)?;
         let postings_composite = CompositeFile::open(&postings_file)?;
@@ -170,9 +165,7 @@ impl SegmentReader {
         let schema = segment.schema();
 
         let fast_fields_data = segment.open_read(SegmentComponent::FastFields)?;
-        let fast_fields_composite = CompositeFile::open(&fast_fields_data)?;
-        let fast_fields_readers =
-            Arc::new(FastFieldReaders::new(schema.clone(), fast_fields_composite));
+        let fast_fields_readers = FastFieldReaders::open(fast_fields_data, schema.clone())?;
         let fieldnorm_data = segment.open_read(SegmentComponent::FieldNorms)?;
         let fieldnorm_readers = FieldNormReaders::open(fieldnorm_data)?;
 
@@ -326,13 +319,13 @@ impl SegmentReader {
             self.termdict_composite.space_usage(),
             self.postings_composite.space_usage(),
             self.positions_composite.space_usage(),
-            self.fast_fields_readers.space_usage(),
+            self.fast_fields_readers.space_usage(self.schema())?,
             self.fieldnorm_readers.space_usage(),
             self.get_store_reader(0)?.space_usage(),
             self.alive_bitset_opt
                 .as_ref()
                 .map(AliveBitSet::space_usage)
-                .unwrap_or(0),
+                .unwrap_or_default(),
         ))
     }
 }

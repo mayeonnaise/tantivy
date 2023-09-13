@@ -1,3 +1,5 @@
+use std::net::Ipv6Addr;
+
 use crate::dictionary::UnorderedId;
 use crate::utils::{place_bits, pop_first_byte, select_bits};
 use crate::value::NumericalValue;
@@ -25,12 +27,12 @@ struct ColumnOperationMetadata {
 
 impl ColumnOperationMetadata {
     fn to_code(self) -> u8 {
-        place_bits::<0, 4>(self.len) | place_bits::<4, 8>(self.op_type.to_code())
+        place_bits::<0, 6>(self.len) | place_bits::<6, 8>(self.op_type.to_code())
     }
 
     fn try_from_code(code: u8) -> Result<Self, InvalidData> {
-        let len = select_bits::<0, 4>(code);
-        let typ_code = select_bits::<4, 8>(code);
+        let len = select_bits::<0, 6>(code);
+        let typ_code = select_bits::<6, 8>(code);
         let column_type = ColumnOperationType::try_from_code(typ_code)?;
         Ok(ColumnOperationMetadata {
             op_type: column_type,
@@ -142,9 +144,21 @@ impl SymbolValue for bool {
     }
 }
 
+impl SymbolValue for Ipv6Addr {
+    fn serialize(self, buffer: &mut [u8]) -> u8 {
+        buffer[0..16].copy_from_slice(&self.octets());
+        16
+    }
+
+    fn deserialize(bytes: &[u8]) -> Self {
+        let octets: [u8; 16] = bytes[0..16].try_into().unwrap();
+        Ipv6Addr::from(octets)
+    }
+}
+
 #[derive(Default)]
 struct MiniBuffer {
-    pub bytes: [u8; 10],
+    pub bytes: [u8; 17],
     pub len: u8,
 }
 
@@ -296,7 +310,7 @@ mod tests {
         buffer.extend_from_slice(b"234234");
         let mut bytes = &buffer[..];
         let serdeser_symbol = ColumnOperation::deserialize(&mut bytes).unwrap();
-        assert_eq!(bytes.len() + buf.as_ref().len() as usize, buffer.len());
+        assert_eq!(bytes.len() + buf.as_ref().len(), buffer.len());
         assert_eq!(column_op, serdeser_symbol);
     }
 
@@ -327,7 +341,7 @@ mod tests {
     fn test_column_operation_unordered_aux(val: u32, expected_len: usize) {
         let column_op = ColumnOperation::Value(UnorderedId(val));
         let minibuf = column_op.serialize();
-        assert_eq!(minibuf.as_ref().len() as usize, expected_len);
+        assert_eq!({ minibuf.as_ref().len() }, expected_len);
         let mut buf = minibuf.as_ref().to_vec();
         buf.extend_from_slice(&[2, 2, 2, 2, 2, 2]);
         let mut cursor = &buf[..];

@@ -4,7 +4,7 @@ use std::collections::{BinaryHeap, HashMap};
 use crate::query::bm25::idf;
 use crate::query::{BooleanQuery, BoostQuery, Occur, Query, TermQuery};
 use crate::schema::{Field, FieldType, IndexRecordOption, Term, Value};
-use crate::tokenizer::{BoxTokenStream, FacetTokenizer, PreTokenizedStream, Tokenizer};
+use crate::tokenizer::{FacetTokenizer, PreTokenizedStream, TokenStream, Tokenizer};
 use crate::{DocAddress, Result, Searcher, TantivyError};
 
 #[derive(Debug, PartialEq)]
@@ -23,13 +23,15 @@ impl Eq for ScoreTerm {}
 
 impl PartialOrd for ScoreTerm {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.score.partial_cmp(&other.score)
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for ScoreTerm {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.partial_cmp(other).unwrap_or(std::cmp::Ordering::Equal)
+        self.score
+            .partial_cmp(&other.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
     }
 }
 
@@ -190,44 +192,47 @@ impl MoreLikeThis {
                     })
                     .collect::<Result<Vec<_>>>()?;
                 for fake_str in facets {
-                    FacetTokenizer.token_stream(fake_str).process(&mut |token| {
-                        if self.is_noise_word(token.text.clone()) {
-                            let term = Term::from_field_text(field, &token.text);
-                            *term_frequencies.entry(term).or_insert(0) += 1;
-                        }
-                    });
+                    FacetTokenizer::default()
+                        .token_stream(fake_str)
+                        .process(&mut |token| {
+                            if self.is_noise_word(token.text.clone()) {
+                                let term = Term::from_field_text(field, &token.text);
+                                *term_frequencies.entry(term).or_insert(0) += 1;
+                            }
+                        });
                 }
             }
             FieldType::Str(text_options) => {
-                let mut token_streams: Vec<BoxTokenStream> = vec![];
-
                 for value in values {
                     match value {
                         Value::PreTokStr(tok_str) => {
-                            token_streams.push(PreTokenizedStream::from(tok_str.clone()).into());
+                            let mut token_stream = PreTokenizedStream::from(tok_str.clone());
+                            token_stream.process(&mut |token| {
+                                if !self.is_noise_word(token.text.clone()) {
+                                    let term = Term::from_field_text(field, &token.text);
+                                    *term_frequencies.entry(term).or_insert(0) += 1;
+                                }
+                            });
                         }
                         Value::Str(ref text) => {
-                            if let Some(tokenizer) = text_options
+                            if let Some(mut tokenizer) = text_options
                                 .get_indexing_options()
                                 .map(|text_indexing_options| {
                                     text_indexing_options.tokenizer().to_string()
                                 })
                                 .and_then(|tokenizer_name| tokenizer_manager.get(&tokenizer_name))
                             {
-                                token_streams.push(tokenizer.token_stream(text));
+                                let mut token_stream = tokenizer.token_stream(text);
+                                token_stream.process(&mut |token| {
+                                    if !self.is_noise_word(token.text.clone()) {
+                                        let term = Term::from_field_text(field, &token.text);
+                                        *term_frequencies.entry(term).or_insert(0) += 1;
+                                    }
+                                });
                             }
                         }
                         _ => (),
                     }
-                }
-
-                for mut token_stream in token_streams {
-                    token_stream.process(&mut |token| {
-                        if !self.is_noise_word(token.text.clone()) {
-                            let term = Term::from_field_text(field, &token.text);
-                            *term_frequencies.entry(term).or_insert(0) += 1;
-                        }
-                    });
                 }
             }
             FieldType::U64(_) => {
@@ -243,14 +248,11 @@ impl MoreLikeThis {
             }
             FieldType::Date(_) => {
                 for value in values {
-                    let timestamp_micros = value
-                        .as_date()
-                        .ok_or_else(|| TantivyError::InvalidArgument("invalid value".to_string()))?
-                        .into_timestamp_micros();
-                    if !self.is_noise_word(timestamp_micros.to_string()) {
-                        let term = Term::from_field_i64(field, timestamp_micros);
-                        *term_frequencies.entry(term).or_insert(0) += 1;
-                    }
+                    let timestamp = value.as_date().ok_or_else(|| {
+                        TantivyError::InvalidArgument("invalid value".to_string())
+                    })?;
+                    let term = Term::from_field_date(field, timestamp);
+                    *term_frequencies.entry(term).or_insert(0) += 1;
                 }
             }
             FieldType::I64(_) => {

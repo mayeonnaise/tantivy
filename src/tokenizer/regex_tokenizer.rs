@@ -1,6 +1,6 @@
 use regex::Regex;
 
-use super::{BoxTokenStream, Token, TokenStream, Tokenizer};
+use super::{Token, TokenStream, Tokenizer};
 use crate::TantivyError;
 
 /// Tokenize the text by using a regex pattern to split.
@@ -22,7 +22,7 @@ use crate::TantivyError;
 /// ```rust
 /// use tantivy::tokenizer::*;
 ///
-/// let tokenizer = RegexTokenizer::new(r"'(?:\w*)'").unwrap();
+/// let mut tokenizer = RegexTokenizer::new(r"'(?:\w*)'").unwrap();
 /// let mut stream = tokenizer.token_stream("'aaa' bbb 'ccc' 'ddd'");
 /// {
 ///     let token = stream.next().unwrap();
@@ -48,6 +48,7 @@ use crate::TantivyError;
 #[derive(Clone)]
 pub struct RegexTokenizer {
     regex: Regex,
+    token: Token,
 }
 
 impl RegexTokenizer {
@@ -55,25 +56,30 @@ impl RegexTokenizer {
     pub fn new(regex_pattern: &str) -> crate::Result<RegexTokenizer> {
         Regex::new(regex_pattern)
             .map_err(|_| TantivyError::InvalidArgument(regex_pattern.to_owned()))
-            .map(|regex| Self { regex })
+            .map(|regex| Self {
+                regex,
+                token: Token::default(),
+            })
     }
 }
 
 impl Tokenizer for RegexTokenizer {
-    fn token_stream<'a>(&self, text: &'a str) -> BoxTokenStream<'a> {
-        BoxTokenStream::from(RegexTokenStream {
+    type TokenStream<'a> = RegexTokenStream<'a>;
+    fn token_stream<'a>(&'a mut self, text: &'a str) -> RegexTokenStream<'a> {
+        self.token.reset();
+        RegexTokenStream {
             regex: self.regex.clone(),
             text,
-            token: Token::default(),
+            token: &mut self.token,
             cursor: 0,
-        })
+        }
     }
 }
 
 pub struct RegexTokenStream<'a> {
     regex: Regex,
     text: &'a str,
-    token: Token,
+    token: &'a mut Token,
     cursor: usize,
 }
 
@@ -99,11 +105,11 @@ impl<'a> TokenStream for RegexTokenStream<'a> {
     }
 
     fn token(&self) -> &Token {
-        &self.token
+        self.token
     }
 
     fn token_mut(&mut self) -> &mut Token {
-        &mut self.token
+        self.token
     }
 }
 
@@ -136,17 +142,17 @@ mod tests {
 
     #[test]
     fn test_regexp_tokenizer_error_on_invalid_regex() {
-        let tokenizer = RegexTokenizer::new(r"\@");
+        let tokenizer = RegexTokenizer::new(r"\@(");
         assert_eq!(tokenizer.is_err(), true);
         assert_eq!(
             tokenizer.err().unwrap().to_string(),
-            "An invalid argument was passed: '\\@'"
+            "An invalid argument was passed: '\\@('"
         );
     }
 
     fn token_stream_helper(text: &str, pattern: &str) -> Vec<Token> {
         let r = RegexTokenizer::new(pattern).unwrap();
-        let a = TextAnalyzer::from(r);
+        let mut a = TextAnalyzer::from(r);
         let mut token_stream = a.token_stream(text);
         let mut tokens: Vec<Token> = vec![];
         let mut add_token = |token: &Token| {

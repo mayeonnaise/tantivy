@@ -2,7 +2,6 @@ use std::cmp::Ordering;
 use std::io::{self, Write};
 
 use common::{BinarySerializable, CountingWriter, VInt};
-use fail::fail_point;
 
 use super::TermInfo;
 use crate::core::Segment;
@@ -13,7 +12,7 @@ use crate::postings::compression::{BlockEncoder, VIntEncoder, COMPRESSION_BLOCK_
 use crate::postings::skip::SkipSerializer;
 use crate::query::Bm25Weight;
 use crate::schema::{Field, FieldEntry, FieldType, IndexRecordOption, Schema};
-use crate::termdict::{TermDictionaryBuilder, TermOrdinal};
+use crate::termdict::TermDictionaryBuilder;
 use crate::{DocId, Score};
 
 /// `InvertedIndexSerializer` is in charge of serializing
@@ -109,7 +108,6 @@ pub struct FieldSerializer<'a> {
     positions_serializer_opt: Option<PositionSerializer<&'a mut CountingWriter<WritePtr>>>,
     current_term_info: TermInfo,
     term_open: bool,
-    num_terms: TermOrdinal,
 }
 
 impl<'a> FieldSerializer<'a> {
@@ -148,7 +146,6 @@ impl<'a> FieldSerializer<'a> {
             positions_serializer_opt,
             current_term_info: TermInfo::default(),
             term_open: false,
-            num_terms: TermOrdinal::default(),
         })
     }
 
@@ -171,20 +168,17 @@ impl<'a> FieldSerializer<'a> {
     /// * term - the term. It needs to come after the previous term according to the lexicographical
     ///   order.
     /// * term_doc_freq - return the number of document containing the term.
-    pub fn new_term(&mut self, term: &[u8], term_doc_freq: u32) -> io::Result<TermOrdinal> {
+    pub fn new_term(&mut self, term: &[u8], term_doc_freq: u32) -> io::Result<()> {
         assert!(
             !self.term_open,
             "Called new_term, while the previous term was not closed."
         );
-
         self.term_open = true;
         self.postings_serializer.clear();
         self.current_term_info = self.current_term_info();
         self.term_dictionary_builder.insert_key(term)?;
-        let term_ordinal = self.num_terms;
-        self.num_terms += 1;
         self.postings_serializer.new_term(term_doc_freq);
-        Ok(term_ordinal)
+        Ok(())
     }
 
     /// Serialize the information that a document contains for the current term:
@@ -210,8 +204,8 @@ impl<'a> FieldSerializer<'a> {
     /// If the current block is incomplete, it needs to be encoded
     /// using `VInt` encoding.
     pub fn close_term(&mut self) -> io::Result<()> {
-        fail_point!("FieldSerializer::close_term", |msg: Option<String>| {
-            Err(io::Error::new(io::ErrorKind::Other, format!("{:?}", msg)))
+        crate::fail_point!("FieldSerializer::close_term", |msg: Option<String>| {
+            Err(io::Error::new(io::ErrorKind::Other, format!("{msg:?}")))
         });
         if self.term_open {
             self.postings_serializer

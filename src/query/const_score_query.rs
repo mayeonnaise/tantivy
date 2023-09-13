@@ -1,5 +1,6 @@
 use std::fmt;
 
+use crate::docset::BUFFER_LEN;
 use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight};
 use crate::{DocId, DocSet, Score, SegmentReader, TantivyError, Term};
 
@@ -71,8 +72,7 @@ impl Weight for ConstWeight {
         let mut scorer = self.scorer(reader, 1.0)?;
         if scorer.seek(doc) != doc {
             return Err(TantivyError::InvalidArgument(format!(
-                "Document #({}) does not match",
-                doc
+                "Document #({doc}) does not match"
             )));
         }
         let mut explanation = Explanation::new("Const", self.score);
@@ -119,7 +119,7 @@ impl<TDocSet: DocSet> DocSet for ConstScorer<TDocSet> {
         self.docset.seek(target)
     }
 
-    fn fill_buffer(&mut self, buffer: &mut [DocId]) -> usize {
+    fn fill_buffer(&mut self, buffer: &mut [DocId; BUFFER_LEN]) -> usize {
         self.docset.fill_buffer(buffer)
     }
 

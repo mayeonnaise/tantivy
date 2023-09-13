@@ -1,7 +1,7 @@
 use std::fmt;
 
+use crate::docset::BUFFER_LEN;
 use crate::fastfield::AliveBitSet;
-use crate::query::explanation::does_not_match;
 use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight};
 use crate::{DocId, DocSet, Score, SegmentReader, Term};
 
@@ -63,12 +63,14 @@ impl Query for BoostQuery {
     }
 }
 
-pub(crate) struct BoostWeight {
+/// Weight associated to the BoostQuery.
+pub struct BoostWeight {
     weight: Box<dyn Weight>,
     boost: Score,
 }
 
 impl BoostWeight {
+    /// Creates a new BoostWeight.
     pub fn new(weight: Box<dyn Weight>, boost: Score) -> Self {
         BoostWeight { weight, boost }
     }
@@ -80,13 +82,9 @@ impl Weight for BoostWeight {
     }
 
     fn explain(&self, reader: &SegmentReader, doc: u32) -> crate::Result<Explanation> {
-        let mut scorer = self.scorer(reader, 1.0)?;
-        if scorer.seek(doc) != doc {
-            return Err(does_not_match(doc));
-        }
-        let mut explanation =
-            Explanation::new(format!("Boost x{} of ...", self.boost), scorer.score());
         let underlying_explanation = self.weight.explain(reader, doc)?;
+        let score = underlying_explanation.value() * self.boost;
+        let mut explanation = Explanation::new(format!("Boost x{} of ...", self.boost), score);
         explanation.add_detail(underlying_explanation);
         Ok(explanation)
     }
@@ -116,7 +114,7 @@ impl<S: Scorer> DocSet for BoostScorer<S> {
         self.underlying.seek(target)
     }
 
-    fn fill_buffer(&mut self, buffer: &mut [DocId]) -> usize {
+    fn fill_buffer(&mut self, buffer: &mut [DocId; BUFFER_LEN]) -> usize {
         self.underlying.fill_buffer(buffer)
     }
 

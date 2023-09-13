@@ -44,7 +44,7 @@
 //! #     let title = schema_builder.add_text_field("title", TEXT);
 //! #     let schema = schema_builder.build();
 //! #     let index = Index::create_in_ram(schema);
-//! #     let mut index_writer = index.writer(3_000_000)?;
+//! #     let mut index_writer = index.writer(15_000_000)?;
 //! #       index_writer.add_document(doc!(
 //! #       title => "The Name of the Wind",
 //! #      ))?;
@@ -104,7 +104,6 @@ pub use self::custom_score_top_collector::{CustomScorer, CustomSegmentScorer};
 
 mod tweak_score_top_collector;
 pub use self::tweak_score_top_collector::{ScoreSegmentTweaker, ScoreTweaker};
-
 mod facet_collector;
 pub use self::facet_collector::{FacetCollector, FacetCounts};
 use crate::query::Weight;
@@ -113,7 +112,7 @@ mod docset_collector;
 pub use self::docset_collector::DocSetCollector;
 
 mod filter_collector_wrapper;
-pub use self::filter_collector_wrapper::FilterCollector;
+pub use self::filter_collector_wrapper::{BytesFilterCollector, FilterCollector};
 
 /// `Fruit` is the type for the result of our collection.
 /// e.g. `usize` for the `Count` collector.
@@ -181,9 +180,11 @@ pub trait Collector: Sync + Send {
                 })?;
             }
             (Some(alive_bitset), false) => {
-                weight.for_each_no_score(reader, &mut |doc| {
-                    if alive_bitset.is_alive(doc) {
-                        segment_collector.collect(doc, 0.0);
+                weight.for_each_no_score(reader, &mut |docs| {
+                    for doc in docs.iter().cloned() {
+                        if alive_bitset.is_alive(doc) {
+                            segment_collector.collect(doc, 0.0);
+                        }
                     }
                 })?;
             }
@@ -193,8 +194,8 @@ pub trait Collector: Sync + Send {
                 })?;
             }
             (None, false) => {
-                weight.for_each_no_score(reader, &mut |doc| {
-                    segment_collector.collect(doc, 0.0);
+                weight.for_each_no_score(reader, &mut |docs| {
+                    segment_collector.collect_block(docs);
                 })?;
             }
         }
@@ -270,6 +271,13 @@ pub trait SegmentCollector: 'static {
 
     /// The query pushes the scored document to the collector via this method.
     fn collect(&mut self, doc: DocId, score: Score);
+
+    /// The query pushes the scored document to the collector via this method.
+    fn collect_block(&mut self, docs: &[DocId]) {
+        for doc in docs {
+            self.collect(*doc, 0.0);
+        }
+    }
 
     /// Extract the fruit of the collection from the `SegmentCollector`.
     fn harvest(self) -> Self::Fruit;

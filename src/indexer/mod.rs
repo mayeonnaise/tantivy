@@ -5,7 +5,6 @@ mod doc_opstamp_mapping;
 mod flat_map_with_buffer;
 pub mod index_writer;
 mod index_writer_status;
-mod json_term_writer;
 mod log_merge_policy;
 mod merge_operation;
 pub mod merge_policy;
@@ -19,17 +18,12 @@ mod segment_register;
 pub mod segment_serializer;
 pub mod segment_updater;
 mod segment_writer;
-mod sorted_doc_id_column;
-mod sorted_doc_id_multivalue_column;
 mod stamper;
 
 use crossbeam_channel as channel;
 use smallvec::SmallVec;
 
 pub use self::index_writer::IndexWriter;
-pub(crate) use self::json_term_writer::{
-    convert_to_fast_value_and_get_term, set_string_and_get_terms, JsonTermWriter,
-};
 pub use self::log_merge_policy::LogMergePolicy;
 pub use self::merge_operation::MergeOperation;
 pub use self::merge_policy::{MergeCandidate, MergePolicy, NoMergePolicy};
@@ -57,6 +51,7 @@ type AddBatchReceiver = channel::Receiver<AddBatch>;
 #[cfg(feature = "mmap")]
 #[cfg(test)]
 mod tests_mmap {
+
     use crate::collector::Count;
     use crate::query::QueryParser;
     use crate::schema::{JsonObjectOptions, Schema, TEXT};
@@ -92,11 +87,20 @@ mod tests_mmap {
         let searcher = reader.searcher();
         assert_eq!(searcher.num_docs(), 1);
         let parse_query = QueryParser::for_index(&index, Vec::new());
-        let query = parse_query
-            .parse_query(r#"json.k8s\.container\.name:prometheus"#)
-            .unwrap();
-        let num_docs = searcher.search(&query, &Count).unwrap();
-        assert_eq!(num_docs, 1);
+        {
+            let query = parse_query
+                .parse_query(r"json.k8s\.container\.name:prometheus")
+                .unwrap();
+            let num_docs = searcher.search(&query, &Count).unwrap();
+            assert_eq!(num_docs, 1);
+        }
+        {
+            let query = parse_query
+                .parse_query(r#"json.k8s.container.name:prometheus"#)
+                .unwrap();
+            let num_docs = searcher.search(&query, &Count).unwrap();
+            assert_eq!(num_docs, 0);
+        }
     }
 
     #[test]
@@ -114,10 +118,19 @@ mod tests_mmap {
         let searcher = reader.searcher();
         assert_eq!(searcher.num_docs(), 1);
         let parse_query = QueryParser::for_index(&index, Vec::new());
-        let query = parse_query
-            .parse_query(r#"json.k8s.container.name:prometheus"#)
-            .unwrap();
-        let num_docs = searcher.search(&query, &Count).unwrap();
-        assert_eq!(num_docs, 1);
+        {
+            let query = parse_query
+                .parse_query(r#"json.k8s.container.name:prometheus"#)
+                .unwrap();
+            let num_docs = searcher.search(&query, &Count).unwrap();
+            assert_eq!(num_docs, 1);
+        }
+        {
+            let query = parse_query
+                .parse_query(r"json.k8s\.container\.name:prometheus")
+                .unwrap();
+            let num_docs = searcher.search(&query, &Count).unwrap();
+            assert_eq!(num_docs, 1);
+        }
     }
 }

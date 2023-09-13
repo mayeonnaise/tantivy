@@ -17,7 +17,7 @@ mod serializer;
 mod skip;
 mod term_info;
 
-pub(crate) use stacker::compute_table_size;
+pub(crate) use stacker::compute_table_memory_size;
 
 pub use self::block_segment_postings::BlockSegmentPostings;
 pub(crate) use self::indexing_context::IndexingContext;
@@ -28,8 +28,6 @@ pub use self::segment_postings::SegmentPostings;
 pub use self::serializer::{FieldSerializer, InvertedIndexSerializer};
 pub(crate) use self::skip::{BlockInfo, SkipReader};
 pub use self::term_info::TermInfo;
-
-pub(crate) type UnorderedTermId = stacker::UnorderedId;
 
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, PartialEq, Clone, Copy, Eq)]
@@ -164,7 +162,7 @@ pub mod tests {
         let index = Index::create_in_ram(schema);
         index
             .tokenizers()
-            .register("simple_no_truncation", SimpleTokenizer);
+            .register("simple_no_truncation", SimpleTokenizer::default());
         let reader = index.reader()?;
         let mut index_writer = index.writer_for_tests()?;
 
@@ -196,7 +194,7 @@ pub mod tests {
         let index = Index::create_in_ram(schema);
         index
             .tokenizers()
-            .register("simple_no_truncation", SimpleTokenizer);
+            .register("simple_no_truncation", SimpleTokenizer::default());
         let reader = index.reader()?;
         let mut index_writer = index.writer_for_tests()?;
 
@@ -227,7 +225,7 @@ pub mod tests {
 
         {
             let mut segment_writer =
-                SegmentWriter::for_segment(3_000_000, segment.clone()).unwrap();
+                SegmentWriter::for_segment(15_000_000, segment.clone()).unwrap();
             {
                 // checking that position works if the field has two values
                 let op = AddOperation {
@@ -546,8 +544,7 @@ pub mod tests {
             let skip_result_unopt = postings_unopt.seek(target);
             assert_eq!(
                 skip_result_unopt, skip_result_opt,
-                "Failed while skipping to {}",
-                target
+                "Failed while skipping to {target}"
             );
             assert!(skip_result_opt >= target);
             assert_eq!(skip_result_opt, postings_opt.doc());

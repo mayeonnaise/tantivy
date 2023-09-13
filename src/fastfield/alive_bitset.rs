@@ -1,9 +1,8 @@
 use std::io;
 use std::io::Write;
 
-use common::{intersect_bitsets, BitSet, OwnedBytes, ReadOnlyBitSet};
+use common::{intersect_bitsets, BitSet, ByteCount, OwnedBytes, ReadOnlyBitSet};
 
-use crate::space_usage::ByteCount;
 use crate::DocId;
 
 /// Write an alive `BitSet`
@@ -47,11 +46,6 @@ impl AliveBitSet {
         write_alive_bitset(&bitset, &mut alive_bitset_buffer).unwrap();
         let alive_bitset_bytes = OwnedBytes::new(alive_bitset_buffer);
         Self::open(alive_bitset_bytes)
-    }
-
-    pub(crate) fn from_bitset(bitset: &BitSet) -> AliveBitSet {
-        let readonly_bitset = ReadOnlyBitSet::from(bitset);
-        AliveBitSet::from(readonly_bitset)
     }
 
     /// Opens an alive bitset given its file.

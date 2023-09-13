@@ -41,10 +41,31 @@ impl ColumnWriter {
     pub(super) fn operation_iterator<'a, V: SymbolValue>(
         &self,
         arena: &MemoryArena,
+        old_to_new_ids_opt: Option<&[RowId]>,
         buffer: &'a mut Vec<u8>,
     ) -> impl Iterator<Item = ColumnOperation<V>> + 'a {
         buffer.clear();
         self.values.read_to_end(arena, buffer);
+        if let Some(old_to_new_ids) = old_to_new_ids_opt {
+            // TODO avoid the extra deserialization / serialization.
+            let mut sorted_ops: Vec<(RowId, ColumnOperation<V>)> = Vec::new();
+            let mut new_doc = 0u32;
+            let mut cursor = &buffer[..];
+            for op in std::iter::from_fn(|| ColumnOperation::<V>::deserialize(&mut cursor)) {
+                if let ColumnOperation::NewDoc(doc) = &op {
+                    new_doc = old_to_new_ids[*doc as usize];
+                    sorted_ops.push((new_doc, ColumnOperation::NewDoc(new_doc)));
+                } else {
+                    sorted_ops.push((new_doc, op));
+                }
+            }
+            // stable sort is crucial here.
+            sorted_ops.sort_by_key(|(new_doc_id, _)| *new_doc_id);
+            buffer.clear();
+            for (_, op) in sorted_ops {
+                buffer.extend_from_slice(op.serialize().as_ref());
+            }
+        }
         let mut cursor: &[u8] = &buffer[..];
         std::iter::from_fn(move || ColumnOperation::deserialize(&mut cursor))
     }
@@ -102,18 +123,29 @@ pub(crate) struct NumericalColumnWriter {
     column_writer: ColumnWriter,
 }
 
+impl NumericalColumnWriter {
+    pub fn force_numerical_type(&mut self, numerical_type: NumericalType) {
+        assert!(self
+            .compatible_numerical_types
+            .is_type_accepted(numerical_type));
+        self.compatible_numerical_types = CompatibleNumericalTypes::StaticType(numerical_type);
+    }
+}
+
 /// State used to store what types are still acceptable
 /// after having seen a set of numerical values.
 #[derive(Clone, Copy)]
-struct CompatibleNumericalTypes {
-    all_values_within_i64_range: bool,
-    all_values_within_u64_range: bool,
-    // f64 is always acceptable.
+pub(crate) enum CompatibleNumericalTypes {
+    Dynamic {
+        all_values_within_i64_range: bool,
+        all_values_within_u64_range: bool,
+    },
+    StaticType(NumericalType),
 }
 
 impl Default for CompatibleNumericalTypes {
     fn default() -> CompatibleNumericalTypes {
-        CompatibleNumericalTypes {
+        CompatibleNumericalTypes::Dynamic {
             all_values_within_i64_range: true,
             all_values_within_u64_range: true,
         }
@@ -121,39 +153,69 @@ impl Default for CompatibleNumericalTypes {
 }
 
 impl CompatibleNumericalTypes {
-    fn accept_value(&mut self, numerical_value: NumericalValue) {
-        match numerical_value {
-            NumericalValue::I64(val_i64) => {
-                let value_within_u64_range = val_i64 >= 0i64;
-                self.all_values_within_u64_range &= value_within_u64_range;
+    pub fn is_type_accepted(&self, numerical_type: NumericalType) -> bool {
+        match self {
+            CompatibleNumericalTypes::Dynamic {
+                all_values_within_i64_range,
+                all_values_within_u64_range,
+            } => match numerical_type {
+                NumericalType::I64 => *all_values_within_i64_range,
+                NumericalType::U64 => *all_values_within_u64_range,
+                NumericalType::F64 => true,
+            },
+            CompatibleNumericalTypes::StaticType(static_numerical_type) => {
+                *static_numerical_type == numerical_type
             }
-            NumericalValue::U64(val_u64) => {
-                let value_within_i64_range = val_u64 < i64::MAX as u64;
-                self.all_values_within_i64_range &= value_within_i64_range;
-            }
-            NumericalValue::F64(_) => {
-                self.all_values_within_i64_range = false;
-                self.all_values_within_u64_range = false;
+        }
+    }
+
+    pub fn accept_value(&mut self, numerical_value: NumericalValue) {
+        match self {
+            CompatibleNumericalTypes::Dynamic {
+                all_values_within_i64_range,
+                all_values_within_u64_range,
+            } => match numerical_value {
+                NumericalValue::I64(val_i64) => {
+                    let value_within_u64_range = val_i64 >= 0i64;
+                    *all_values_within_u64_range &= value_within_u64_range;
+                }
+                NumericalValue::U64(val_u64) => {
+                    let value_within_i64_range = val_u64 < i64::MAX as u64;
+                    *all_values_within_i64_range &= value_within_i64_range;
+                }
+                NumericalValue::F64(_) => {
+                    *all_values_within_i64_range = false;
+                    *all_values_within_u64_range = false;
+                }
+            },
+            CompatibleNumericalTypes::StaticType(typ) => {
+                assert_eq!(
+                    numerical_value.numerical_type(),
+                    *typ,
+                    "Input type forbidden. This column has been forced to type {typ:?}, received \
+                     {numerical_value:?}"
+                );
             }
         }
     }
 
     pub fn to_numerical_type(self) -> NumericalType {
-        if self.all_values_within_i64_range {
-            NumericalType::I64
-        } else if self.all_values_within_u64_range {
-            NumericalType::U64
-        } else {
-            NumericalType::F64
+        for numerical_type in [NumericalType::I64, NumericalType::U64] {
+            if self.is_type_accepted(numerical_type) {
+                return numerical_type;
+            }
         }
+        NumericalType::F64
     }
 }
 
 impl NumericalColumnWriter {
-    pub fn column_type_and_cardinality(&self, num_docs: RowId) -> (NumericalType, Cardinality) {
-        let numerical_type = self.compatible_numerical_types.to_numerical_type();
-        let cardinality = self.column_writer.get_cardinality(num_docs);
-        (numerical_type, cardinality)
+    pub fn numerical_type(&self) -> NumericalType {
+        self.compatible_numerical_types.to_numerical_type()
+    }
+
+    pub fn cardinality(&self, num_docs: RowId) -> Cardinality {
+        self.column_writer.get_cardinality(num_docs)
     }
 
     pub fn record_numerical_value(
@@ -169,23 +231,34 @@ impl NumericalColumnWriter {
     pub(super) fn operation_iterator<'a>(
         self,
         arena: &MemoryArena,
+        old_to_new_ids: Option<&[RowId]>,
         buffer: &'a mut Vec<u8>,
     ) -> impl Iterator<Item = ColumnOperation<NumericalValue>> + 'a {
-        self.column_writer.operation_iterator(arena, buffer)
+        self.column_writer
+            .operation_iterator(arena, old_to_new_ids, buffer)
     }
 }
 
-#[derive(Copy, Clone, Default)]
-pub(crate) struct StrColumnWriter {
+#[derive(Copy, Clone)]
+pub(crate) struct StrOrBytesColumnWriter {
     pub(crate) dictionary_id: u32,
     pub(crate) column_writer: ColumnWriter,
+    // If true, when facing a multivalued cardinality,
+    // values associated to a given document will be sorted.
+    //
+    // This is useful for facets.
+    //
+    // If false, the order of appearance in the document will be
+    // observed.
+    pub(crate) sort_values_within_row: bool,
 }
 
-impl StrColumnWriter {
-    pub(crate) fn with_dictionary_id(dictionary_id: u32) -> StrColumnWriter {
-        StrColumnWriter {
+impl StrOrBytesColumnWriter {
+    pub(crate) fn with_dictionary_id(dictionary_id: u32) -> StrOrBytesColumnWriter {
+        StrOrBytesColumnWriter {
             dictionary_id,
             column_writer: Default::default(),
+            sort_values_within_row: false,
         }
     }
 
@@ -203,9 +276,11 @@ impl StrColumnWriter {
     pub(super) fn operation_iterator<'a>(
         &self,
         arena: &MemoryArena,
+        old_to_new_ids: Option<&[RowId]>,
         byte_buffer: &'a mut Vec<u8>,
     ) -> impl Iterator<Item = ColumnOperation<UnorderedId>> + 'a {
-        self.column_writer.operation_iterator(arena, byte_buffer)
+        self.column_writer
+            .operation_iterator(arena, old_to_new_ids, byte_buffer)
     }
 }
 
@@ -261,5 +336,28 @@ mod tests {
         test_column_writer_coercion_aux(&[(1u64 << 63).into()], NumericalType::U64);
         test_column_writer_coercion_aux(&[1i64.into(), 1u64.into()], NumericalType::I64);
         test_column_writer_coercion_aux(&[u64::MAX.into(), (-1i64).into()], NumericalType::F64);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_compatible_numerical_types_static_incompatible_type() {
+        let mut compatible_numerical_types =
+            CompatibleNumericalTypes::StaticType(NumericalType::U64);
+        compatible_numerical_types.accept_value(NumericalValue::I64(1i64));
+    }
+
+    #[test]
+    fn test_compatible_numerical_types_static_different_type_forbidden() {
+        let mut compatible_numerical_types =
+            CompatibleNumericalTypes::StaticType(NumericalType::U64);
+        compatible_numerical_types.accept_value(NumericalValue::U64(u64::MAX));
+    }
+
+    #[test]
+    fn test_compatible_numerical_types_static() {
+        for typ in [NumericalType::I64, NumericalType::I64, NumericalType::F64] {
+            let compatible_numerical_types = CompatibleNumericalTypes::StaticType(typ);
+            assert_eq!(compatible_numerical_types.to_numerical_type(), typ);
+        }
     }
 }

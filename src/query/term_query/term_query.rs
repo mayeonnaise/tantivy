@@ -27,7 +27,7 @@ use crate::Term;
 /// let schema = schema_builder.build();
 /// let index = Index::create_in_ram(schema);
 /// {
-///     let mut index_writer = index.writer(3_000_000)?;
+///     let mut index_writer = index.writer(15_000_000)?;
 ///     index_writer.add_document(doc!(
 ///         title => "The Name of the Wind",
 ///     ))?;
@@ -96,9 +96,10 @@ impl TermQuery {
             return Err(crate::TantivyError::SchemaError(error_msg));
         }
         let bm25_weight = match enable_scoring {
-            EnableScoring::Enabled(searcher) => {
-                Bm25Weight::for_terms(searcher, &[self.term.clone()])?
-            }
+            EnableScoring::Enabled {
+                statistics_provider,
+                ..
+            } => Bm25Weight::for_terms(statistics_provider, &[self.term.clone()])?,
             EnableScoring::Disabled { .. } => {
                 Bm25Weight::new(Explanation::new("<no score>".to_string(), 1.0f32), 1.0f32)
             }
@@ -109,6 +110,7 @@ impl TermQuery {
         } else {
             IndexRecordOption::Basic
         };
+
         Ok(TermWeight::new(
             self.term.clone(),
             index_record_option,
@@ -132,7 +134,7 @@ mod tests {
     use std::net::{IpAddr, Ipv6Addr};
     use std::str::FromStr;
 
-    use fastfield_codecs::MonotonicallyMappableToU128;
+    use columnar::MonotonicallyMappableToU128;
 
     use crate::collector::{Count, TopDocs};
     use crate::query::{Query, QueryParser, TermQuery};
@@ -149,7 +151,7 @@ mod tests {
         let ip_addr_2 = Ipv6Addr::from_u128(10);
 
         {
-            let mut index_writer = index.writer(3_000_000).unwrap();
+            let mut index_writer = index.writer_for_tests().unwrap();
             index_writer
                 .add_document(doc!(
                     ip_field => ip_addr_1
@@ -189,7 +191,7 @@ mod tests {
         assert_single_hit(query_from_ip(ip_addr_2));
         assert_single_hit(query_from_text("127.0.0.1".to_string()));
         assert_single_hit(query_from_text("\"127.0.0.1\"".to_string()));
-        assert_single_hit(query_from_text(format!("\"{}\"", ip_addr_1)));
-        assert_single_hit(query_from_text(format!("\"{}\"", ip_addr_2)));
+        assert_single_hit(query_from_text(format!("\"{ip_addr_1}\"")));
+        assert_single_hit(query_from_text(format!("\"{ip_addr_2}\"")));
     }
 }

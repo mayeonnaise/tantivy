@@ -123,129 +123,9 @@ mod functional_test;
 mod macros;
 mod future_result;
 
-/// Re-export of the `time` crate
-///
-/// Tantivy uses [`time`](https://crates.io/crates/time) for dates.
-pub use time;
-
-use crate::time::format_description::well_known::Rfc3339;
-use crate::time::{OffsetDateTime, PrimitiveDateTime, UtcOffset};
-
-/// A date/time value with microsecond precision.
-///
-/// This timestamp does not carry any explicit time zone information.
-/// Users are responsible for applying the provided conversion
-/// functions consistently. Internally the time zone is assumed
-/// to be UTC, which is also used implicitly for JSON serialization.
-///
-/// All constructors and conversions are provided as explicit
-/// functions and not by implementing any `From`/`Into` traits
-/// to prevent unintended usage.
-#[derive(Clone, Default, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct DateTime {
-    // Timestamp in microseconds.
-    pub(crate) timestamp_micros: i64,
-}
-
-impl DateTime {
-    /// Create new from UNIX timestamp in seconds
-    pub const fn from_timestamp_secs(seconds: i64) -> Self {
-        Self {
-            timestamp_micros: seconds * 1_000_000,
-        }
-    }
-
-    /// Create new from UNIX timestamp in milliseconds
-    pub const fn from_timestamp_millis(milliseconds: i64) -> Self {
-        Self {
-            timestamp_micros: milliseconds * 1_000,
-        }
-    }
-
-    /// Create new from UNIX timestamp in microseconds.
-    pub const fn from_timestamp_micros(microseconds: i64) -> Self {
-        Self {
-            timestamp_micros: microseconds,
-        }
-    }
-
-    /// Create new from `OffsetDateTime`
-    ///
-    /// The given date/time is converted to UTC and the actual
-    /// time zone is discarded.
-    pub const fn from_utc(dt: OffsetDateTime) -> Self {
-        let timestamp_micros = dt.unix_timestamp() * 1_000_000 + dt.microsecond() as i64;
-        Self { timestamp_micros }
-    }
-
-    /// Create new from `PrimitiveDateTime`
-    ///
-    /// Implicitly assumes that the given date/time is in UTC!
-    /// Otherwise the original value must only be reobtained with
-    /// [`Self::into_primitive()`].
-    pub fn from_primitive(dt: PrimitiveDateTime) -> Self {
-        Self::from_utc(dt.assume_utc())
-    }
-
-    /// Convert to UNIX timestamp in seconds.
-    pub const fn into_timestamp_secs(self) -> i64 {
-        self.timestamp_micros / 1_000_000
-    }
-
-    /// Convert to UNIX timestamp in milliseconds.
-    pub const fn into_timestamp_millis(self) -> i64 {
-        self.timestamp_micros / 1_000
-    }
-
-    /// Convert to UNIX timestamp in microseconds.
-    pub const fn into_timestamp_micros(self) -> i64 {
-        self.timestamp_micros
-    }
-
-    /// Convert to UTC `OffsetDateTime`
-    pub fn into_utc(self) -> OffsetDateTime {
-        let timestamp_nanos = self.timestamp_micros as i128 * 1000;
-        let utc_datetime = OffsetDateTime::from_unix_timestamp_nanos(timestamp_nanos)
-            .expect("valid UNIX timestamp");
-        debug_assert_eq!(UtcOffset::UTC, utc_datetime.offset());
-        utc_datetime
-    }
-
-    /// Convert to `OffsetDateTime` with the given time zone
-    pub fn into_offset(self, offset: UtcOffset) -> OffsetDateTime {
-        self.into_utc().to_offset(offset)
-    }
-
-    /// Convert to `PrimitiveDateTime` without any time zone
-    ///
-    /// The value should have been constructed with [`Self::from_primitive()`].
-    /// Otherwise the time zone is implicitly assumed to be UTC.
-    pub fn into_primitive(self) -> PrimitiveDateTime {
-        let utc_datetime = self.into_utc();
-        // Discard the UTC time zone offset
-        debug_assert_eq!(UtcOffset::UTC, utc_datetime.offset());
-        PrimitiveDateTime::new(utc_datetime.date(), utc_datetime.time())
-    }
-
-    /// Truncates the microseconds value to the corresponding precision.
-    pub(crate) fn truncate(self, precision: DatePrecision) -> Self {
-        let truncated_timestamp_micros = match precision {
-            DatePrecision::Seconds => (self.timestamp_micros / 1_000_000) * 1_000_000,
-            DatePrecision::Milliseconds => (self.timestamp_micros / 1_000) * 1_000,
-            DatePrecision::Microseconds => self.timestamp_micros,
-        };
-        Self {
-            timestamp_micros: truncated_timestamp_micros,
-        }
-    }
-}
-
-impl fmt::Debug for DateTime {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let utc_rfc3339 = self.into_utc().format(&Rfc3339).map_err(|_| fmt::Error)?;
-        f.write_str(&utc_rfc3339)
-    }
-}
+// Re-exports
+pub use common::DateTime;
+pub use {columnar, query_grammar, time};
 
 pub use crate::error::TantivyError;
 pub use crate::future_result::FutureResult;
@@ -293,6 +173,8 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 
 pub use self::docset::{DocSet, TERMINATED};
+#[doc(hidden)]
+pub use crate::core::json_utils;
 pub use crate::core::{
     Executor, Index, IndexBuilder, IndexMeta, IndexSettings, IndexSortByField, InvertedIndexReader,
     Order, Searcher, SearcherGeneration, Segment, SegmentComponent, SegmentId, SegmentMeta,
@@ -302,10 +184,15 @@ pub use crate::directory::Directory;
 pub use crate::indexer::operation::UserOperation;
 pub use crate::indexer::{merge_filtered_segments, merge_indices, IndexWriter, PreparedCommit};
 pub use crate::postings::Postings;
-pub use crate::schema::{DateOptions, DatePrecision, Document, Term};
+#[allow(deprecated)]
+pub use crate::schema::DatePrecision;
+pub use crate::schema::{DateOptions, DateTimePrecision, Document, Term};
 
 /// Index format version.
 const INDEX_FORMAT_VERSION: u32 = 5;
+
+#[cfg(all(feature = "mmap", unix))]
+pub use memmap2::Advice;
 
 /// Structure version for the index.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -412,9 +299,39 @@ pub struct DocAddress {
     pub doc_id: DocId,
 }
 
+#[macro_export]
+/// Enable fail_point if feature is enabled.
+macro_rules! fail_point {
+    ($name:expr) => {{
+        #[cfg(feature = "failpoints")]
+        {
+            fail::eval($name, |_| {
+                panic!("Return is not supported for the fail point \"{}\"", $name);
+            });
+        }
+    }};
+    ($name:expr, $e:expr) => {{
+        #[cfg(feature = "failpoints")]
+        {
+            if let Some(res) = fail::eval($name, $e) {
+                return res;
+            }
+        }
+    }};
+    ($name:expr, $cond:expr, $e:expr) => {{
+        #[cfg(feature = "failpoints")]
+        {
+            if $cond {
+                fail::fail_point!($name, $e);
+            }
+        }
+    }};
+}
+
 #[cfg(test)]
 pub mod tests {
     use common::{BinarySerializable, FixedSize};
+    use query_grammar::{UserInputAst, UserInputLeaf, UserInputLiteral};
     use rand::distributions::{Bernoulli, Uniform};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
@@ -971,6 +888,95 @@ pub mod tests {
     }
 
     #[test]
+    fn test_searcher_on_json_field_with_type_inference() {
+        // When indexing and searching a json value, we infer its type.
+        // This tests aims to check the type infereence is consistent between indexing and search.
+        // Inference order is date, i64, u64, f64, bool.
+        let mut schema_builder = Schema::builder();
+        let json_field = schema_builder.add_json_field("json", STORED | TEXT);
+        let schema = schema_builder.build();
+        let json_val: serde_json::Map<String, serde_json::Value> = serde_json::from_str(
+            r#"{
+            "signed": 2,
+            "float": 2.0,
+            "unsigned": 10000000000000,
+            "date": "1985-04-12T23:20:50.52Z",
+            "bool": true
+        }"#,
+        )
+        .unwrap();
+        let doc = doc!(json_field=>json_val);
+        let index = Index::create_in_ram(schema);
+        let mut writer = index.writer_for_tests().unwrap();
+        writer.add_document(doc).unwrap();
+        writer.commit().unwrap();
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        let get_doc_ids = |user_input_literal: UserInputLiteral| {
+            let query_parser = crate::query::QueryParser::for_index(&index, Vec::new());
+            let query = query_parser
+                .build_query_from_user_input_ast(UserInputAst::from(UserInputLeaf::Literal(
+                    user_input_literal,
+                )))
+                .unwrap();
+            searcher
+                .search(&query, &TEST_COLLECTOR_WITH_SCORE)
+                .map(|topdocs| topdocs.docs().to_vec())
+                .unwrap()
+        };
+        {
+            let user_input_literal = UserInputLiteral {
+                field_name: Some("json.signed".to_string()),
+                phrase: "2".to_string(),
+                delimiter: crate::query_grammar::Delimiter::None,
+                slop: 0,
+                prefix: false,
+            };
+            assert_eq!(get_doc_ids(user_input_literal), vec![DocAddress::new(0, 0)]);
+        }
+        {
+            let user_input_literal = UserInputLiteral {
+                field_name: Some("json.float".to_string()),
+                phrase: "2.0".to_string(),
+                delimiter: crate::query_grammar::Delimiter::None,
+                slop: 0,
+                prefix: false,
+            };
+            assert_eq!(get_doc_ids(user_input_literal), vec![DocAddress::new(0, 0)]);
+        }
+        {
+            let user_input_literal = UserInputLiteral {
+                field_name: Some("json.date".to_string()),
+                phrase: "1985-04-12T23:20:50.52Z".to_string(),
+                delimiter: crate::query_grammar::Delimiter::None,
+                slop: 0,
+                prefix: false,
+            };
+            assert_eq!(get_doc_ids(user_input_literal), vec![DocAddress::new(0, 0)]);
+        }
+        {
+            let user_input_literal = UserInputLiteral {
+                field_name: Some("json.unsigned".to_string()),
+                phrase: "10000000000000".to_string(),
+                delimiter: crate::query_grammar::Delimiter::None,
+                slop: 0,
+                prefix: false,
+            };
+            assert_eq!(get_doc_ids(user_input_literal), vec![DocAddress::new(0, 0)]);
+        }
+        {
+            let user_input_literal = UserInputLiteral {
+                field_name: Some("json.bool".to_string()),
+                phrase: "true".to_string(),
+                delimiter: crate::query_grammar::Delimiter::None,
+                slop: 0,
+                prefix: false,
+            };
+            assert_eq!(get_doc_ids(user_input_literal), vec![DocAddress::new(0, 0)]);
+        }
+    }
+
+    #[test]
     fn test_doc_macro() {
         let mut schema_builder = Schema::builder();
         let text_field = schema_builder.add_text_field("text", TEXT);
@@ -1029,21 +1035,21 @@ pub mod tests {
             let fast_field_reader_opt = segment_reader.fast_fields().u64("unsigned");
             assert!(fast_field_reader_opt.is_ok());
             let fast_field_reader = fast_field_reader_opt.unwrap();
-            assert_eq!(fast_field_reader.get_val(0), 4u64)
+            assert_eq!(fast_field_reader.first(0), Some(4u64))
         }
 
         {
             let fast_field_reader_res = segment_reader.fast_fields().i64("signed");
             assert!(fast_field_reader_res.is_ok());
             let fast_field_reader = fast_field_reader_res.unwrap();
-            assert_eq!(fast_field_reader.get_val(0), 4i64)
+            assert_eq!(fast_field_reader.first(0), Some(4i64))
         }
 
         {
             let fast_field_reader_res = segment_reader.fast_fields().f64("float");
             assert!(fast_field_reader_res.is_ok());
             let fast_field_reader = fast_field_reader_res.unwrap();
-            assert_eq!(fast_field_reader.get_val(0), 4f64)
+            assert_eq!(fast_field_reader.first(0), Some(4f64))
         }
         Ok(())
     }
@@ -1143,8 +1149,8 @@ pub mod tests {
         let dt = DateTime::from_utc(now).into_utc();
         assert_eq!(dt.to_ordinal_date(), now.to_ordinal_date());
         assert_eq!(dt.to_hms_micro(), now.to_hms_micro());
-        // We don't store nanosecond level precision.
-        assert_eq!(dt.nanosecond(), now.microsecond() * 1000);
+        // We store nanosecond level precision.
+        assert_eq!(dt.nanosecond(), now.nanosecond());
 
         let dt = DateTime::from_timestamp_secs(now.unix_timestamp()).into_utc();
         assert_eq!(dt.to_ordinal_date(), now.to_ordinal_date());
@@ -1158,7 +1164,7 @@ pub mod tests {
         assert_eq!(dt.to_hms_micro(), now.to_hms_micro());
 
         let dt_from_ts_nanos =
-            OffsetDateTime::from_unix_timestamp_nanos(18446744073709551615i128).unwrap();
+            OffsetDateTime::from_unix_timestamp_nanos(1492432621123456789).unwrap();
         let offset_dt = DateTime::from_utc(dt_from_ts_nanos).into_utc();
         assert_eq!(
             dt_from_ts_nanos.to_ordinal_date(),

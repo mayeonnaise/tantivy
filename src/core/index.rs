@@ -16,10 +16,10 @@ use crate::directory::error::OpenReadError;
 use crate::directory::MmapDirectory;
 use crate::directory::{Directory, ManagedDirectory, RamDirectory, INDEX_WRITER_LOCK};
 use crate::error::{DataCorruption, TantivyError};
-use crate::indexer::index_writer::{MAX_NUM_THREAD, MEMORY_ARENA_NUM_BYTES_MIN};
+use crate::indexer::index_writer::{MAX_NUM_THREAD, MEMORY_BUDGET_NUM_BYTES_MIN};
 use crate::indexer::segment_updater::save_metas;
 use crate::reader::{IndexReader, IndexReaderBuilder};
-use crate::schema::{Cardinality, Field, FieldType, Schema};
+use crate::schema::{Field, FieldType, Schema};
 use crate::tokenizer::{TextAnalyzer, TokenizerManager};
 use crate::IndexWriter;
 
@@ -39,10 +39,7 @@ fn load_metas(
         .map_err(|e| {
             DataCorruption::new(
                 META_FILEPATH.to_path_buf(),
-                format!(
-                    "Meta file cannot be deserialized. {:?}. Content: {:?}",
-                    e, meta_string
-                ),
+                format!("Meta file cannot be deserialized. {e:?}. Content: {meta_string:?}"),
             )
         })
         .map_err(From::from)
@@ -93,7 +90,7 @@ fn save_new_metas(
 /// let body_field = schema_builder.add_text_field("body", TEXT);
 /// let number_field = schema_builder.add_u64_field(
 ///     "number",
-///     NumericOptions::default().set_fast(Cardinality::SingleValue),
+///     NumericOptions::default().set_fast(),
 /// );
 ///
 /// let schema = schema_builder.build();
@@ -110,6 +107,7 @@ pub struct IndexBuilder {
     schema: Option<Schema>,
     index_settings: IndexSettings,
     tokenizer_manager: TokenizerManager,
+    fast_field_tokenizer_manager: TokenizerManager,
 }
 impl Default for IndexBuilder {
     fn default() -> Self {
@@ -123,6 +121,7 @@ impl IndexBuilder {
             schema: None,
             index_settings: IndexSettings::default(),
             tokenizer_manager: TokenizerManager::default(),
+            fast_field_tokenizer_manager: TokenizerManager::default(),
         }
     }
 
@@ -140,9 +139,15 @@ impl IndexBuilder {
         self
     }
 
-    /// Set the tokenizers .
+    /// Set the tokenizers.
     pub fn tokenizers(mut self, tokenizers: TokenizerManager) -> Self {
         self.tokenizer_manager = tokenizers;
+        self
+    }
+
+    /// Set the fast field tokenizers.
+    pub fn fast_field_tokenizers(mut self, tokenizers: TokenizerManager) -> Self {
+        self.fast_field_tokenizer_manager = tokenizers;
         self
     }
 
@@ -245,12 +250,6 @@ impl IndexBuilder {
                         sort_by_field.field
                     )));
                 }
-                if entry.field_type().fastfield_cardinality() != Some(Cardinality::SingleValue) {
-                    return Err(TantivyError::InvalidArgument(format!(
-                        "Only single value fast field Cardinality supported for sorting index {}",
-                        sort_by_field.field
-                    )));
-                }
             }
             Ok(())
         } else {
@@ -276,6 +275,7 @@ impl IndexBuilder {
         metas.index_settings = self.index_settings;
         let mut index = Index::open_from_metas(directory, &metas, SegmentMetaInventory::default());
         index.set_tokenizers(self.tokenizer_manager);
+        index.set_fast_field_tokenizers(self.fast_field_tokenizer_manager);
         Ok(index)
     }
 }
@@ -288,6 +288,7 @@ pub struct Index {
     settings: IndexSettings,
     executor: Arc<Executor>,
     tokenizers: TokenizerManager,
+    fast_field_tokenizers: TokenizerManager,
     inventory: SegmentMetaInventory,
 }
 
@@ -400,6 +401,7 @@ impl Index {
             directory,
             schema,
             tokenizers: TokenizerManager::default(),
+            fast_field_tokenizers: TokenizerManager::default(),
             executor: Arc::new(Executor::single_thread()),
             inventory,
         }
@@ -413,6 +415,16 @@ impl Index {
     /// Accessor for the tokenizer manager.
     pub fn tokenizers(&self) -> &TokenizerManager {
         &self.tokenizers
+    }
+
+    /// Setter for the fast field tokenizer manager.
+    pub fn set_fast_field_tokenizers(&mut self, tokenizers: TokenizerManager) {
+        self.fast_field_tokenizers = tokenizers;
+    }
+
+    /// Accessor for the fast field tokenizer manager.
+    pub fn fast_field_tokenizer(&self) -> &TokenizerManager {
+        &self.fast_field_tokenizers
     }
 
     /// Get the tokenizer associated with a specific field.
@@ -432,8 +444,7 @@ impl Index {
         };
         let indexing_options = indexing_options_opt.ok_or_else(|| {
             TantivyError::InvalidArgument(format!(
-                "No indexing options set for field {:?}",
-                field_entry
+                "No indexing options set for field {field_entry:?}"
             ))
         })?;
 
@@ -441,8 +452,7 @@ impl Index {
             .get(indexing_options.tokenizer())
             .ok_or_else(|| {
                 TantivyError::InvalidArgument(format!(
-                    "No Tokenizer found for field {:?}",
-                    field_entry
+                    "No Tokenizer found for field {field_entry:?}"
                 ))
             })
     }
@@ -513,9 +523,9 @@ impl Index {
     /// - `num_threads` defines the number of indexing workers that
     /// should work at the same time.
     ///
-    /// - `overall_memory_arena_in_bytes` sets the amount of memory
+    /// - `overall_memory_budget_in_bytes` sets the amount of memory
     /// allocated for all indexing thread.
-    /// Each thread will receive a budget of  `overall_memory_arena_in_bytes / num_threads`.
+    /// Each thread will receive a budget of  `overall_memory_budget_in_bytes / num_threads`.
     ///
     /// # Errors
     /// If the lockfile already exists, returns `Error::DirectoryLockBusy` or an `Error::IoError`.
@@ -524,7 +534,7 @@ impl Index {
     pub fn writer_with_num_threads(
         &self,
         num_threads: usize,
-        overall_memory_arena_in_bytes: usize,
+        overall_memory_budget_in_bytes: usize,
     ) -> crate::Result<IndexWriter> {
         let directory_lock = self
             .directory
@@ -540,7 +550,7 @@ impl Index {
                     ),
                 )
             })?;
-        let memory_arena_in_bytes_per_thread = overall_memory_arena_in_bytes / num_threads;
+        let memory_arena_in_bytes_per_thread = overall_memory_budget_in_bytes / num_threads;
         IndexWriter::new(
             self,
             num_threads,
@@ -551,11 +561,11 @@ impl Index {
 
     /// Helper to create an index writer for tests.
     ///
-    /// That index writer only simply has a single thread and a memory arena of 10 MB.
+    /// That index writer only simply has a single thread and a memory budget of 15 MB.
     /// Using a single thread gives us a deterministic allocation of DocId.
     #[cfg(test)]
     pub fn writer_for_tests(&self) -> crate::Result<IndexWriter> {
-        self.writer_with_num_threads(1, 10_000_000)
+        self.writer_with_num_threads(1, 15_000_000)
     }
 
     /// Creates a multithreaded writer
@@ -569,13 +579,13 @@ impl Index {
     /// If the lockfile already exists, returns `Error::FileAlreadyExists`.
     /// If the memory arena per thread is too small or too big, returns
     /// `TantivyError::InvalidArgument`
-    pub fn writer(&self, memory_arena_num_bytes: usize) -> crate::Result<IndexWriter> {
+    pub fn writer(&self, memory_budget_in_bytes: usize) -> crate::Result<IndexWriter> {
         let mut num_threads = std::cmp::min(num_cpus::get(), MAX_NUM_THREAD);
-        let memory_arena_num_bytes_per_thread = memory_arena_num_bytes / num_threads;
-        if memory_arena_num_bytes_per_thread < MEMORY_ARENA_NUM_BYTES_MIN {
-            num_threads = (memory_arena_num_bytes / MEMORY_ARENA_NUM_BYTES_MIN).max(1);
+        let memory_budget_num_bytes_per_thread = memory_budget_in_bytes / num_threads;
+        if memory_budget_num_bytes_per_thread < MEMORY_BUDGET_NUM_BYTES_MIN {
+            num_threads = (memory_budget_in_bytes / MEMORY_BUDGET_NUM_BYTES_MIN).max(1);
         }
-        self.writer_with_num_threads(num_threads, memory_arena_num_bytes)
+        self.writer_with_num_threads(num_threads, memory_budget_in_bytes)
     }
 
     /// Accessor to the index settings
@@ -666,304 +676,5 @@ impl Index {
 impl fmt::Debug for Index {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Index({:?})", self.directory)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::collector::Count;
-    use crate::directory::{RamDirectory, WatchCallback};
-    use crate::query::TermQuery;
-    use crate::schema::{Field, IndexRecordOption, Schema, INDEXED, TEXT};
-    use crate::tokenizer::TokenizerManager;
-    use crate::{Directory, Index, IndexBuilder, IndexReader, IndexSettings, ReloadPolicy, Term};
-
-    #[test]
-    fn test_indexer_for_field() {
-        let mut schema_builder = Schema::builder();
-        let num_likes_field = schema_builder.add_u64_field("num_likes", INDEXED);
-        let body_field = schema_builder.add_text_field("body", TEXT);
-        let schema = schema_builder.build();
-        let index = Index::create_in_ram(schema);
-        assert!(index.tokenizer_for_field(body_field).is_ok());
-        assert_eq!(
-            format!("{:?}", index.tokenizer_for_field(num_likes_field).err()),
-            "Some(SchemaError(\"\\\"num_likes\\\" is not a text field.\"))"
-        );
-    }
-
-    #[test]
-    fn test_set_tokenizer_manager() {
-        let mut schema_builder = Schema::builder();
-        schema_builder.add_u64_field("num_likes", INDEXED);
-        schema_builder.add_text_field("body", TEXT);
-        let schema = schema_builder.build();
-        let index = IndexBuilder::new()
-            // set empty tokenizer manager
-            .tokenizers(TokenizerManager::new())
-            .schema(schema)
-            .create_in_ram()
-            .unwrap();
-        assert!(index.tokenizers().get("raw").is_none());
-    }
-
-    #[test]
-    fn test_index_exists() {
-        let directory: Box<dyn Directory> = Box::new(RamDirectory::create());
-        assert!(!Index::exists(directory.as_ref()).unwrap());
-        assert!(Index::create(
-            directory.clone(),
-            throw_away_schema(),
-            IndexSettings::default()
-        )
-        .is_ok());
-        assert!(Index::exists(directory.as_ref()).unwrap());
-    }
-
-    #[test]
-    fn open_or_create_should_create() {
-        let directory = RamDirectory::create();
-        assert!(!Index::exists(&directory).unwrap());
-        assert!(Index::open_or_create(directory.clone(), throw_away_schema()).is_ok());
-        assert!(Index::exists(&directory).unwrap());
-    }
-
-    #[test]
-    fn open_or_create_should_open() {
-        let directory: Box<dyn Directory> = Box::new(RamDirectory::create());
-        assert!(Index::create(
-            directory.clone(),
-            throw_away_schema(),
-            IndexSettings::default()
-        )
-        .is_ok());
-        assert!(Index::exists(directory.as_ref()).unwrap());
-        assert!(Index::open_or_create(directory, throw_away_schema()).is_ok());
-    }
-
-    #[test]
-    fn create_should_wipeoff_existing() {
-        let directory: Box<dyn Directory> = Box::new(RamDirectory::create());
-        assert!(Index::create(
-            directory.clone(),
-            throw_away_schema(),
-            IndexSettings::default()
-        )
-        .is_ok());
-        assert!(Index::exists(directory.as_ref()).unwrap());
-        assert!(Index::create(
-            directory,
-            Schema::builder().build(),
-            IndexSettings::default()
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn open_or_create_exists_but_schema_does_not_match() {
-        let directory = RamDirectory::create();
-        assert!(Index::create(
-            directory.clone(),
-            throw_away_schema(),
-            IndexSettings::default()
-        )
-        .is_ok());
-        assert!(Index::exists(&directory).unwrap());
-        assert!(Index::open_or_create(directory.clone(), throw_away_schema()).is_ok());
-        let err = Index::open_or_create(directory, Schema::builder().build());
-        assert_eq!(
-            format!("{:?}", err.unwrap_err()),
-            "SchemaError(\"An index exists but the schema does not match.\")"
-        );
-    }
-
-    fn throw_away_schema() -> Schema {
-        let mut schema_builder = Schema::builder();
-        let _ = schema_builder.add_u64_field("num_likes", INDEXED);
-        schema_builder.build()
-    }
-
-    #[test]
-    fn test_index_on_commit_reload_policy() -> crate::Result<()> {
-        let schema = throw_away_schema();
-        let field = schema.get_field("num_likes").unwrap();
-        let index = Index::create_in_ram(schema);
-        let reader = index
-            .reader_builder()
-            .reload_policy(ReloadPolicy::OnCommit)
-            .try_into()
-            .unwrap();
-        assert_eq!(reader.searcher().num_docs(), 0);
-        test_index_on_commit_reload_policy_aux(field, &index, &reader)
-    }
-
-    #[cfg(feature = "mmap")]
-    mod mmap_specific {
-
-        use std::path::PathBuf;
-
-        use tempfile::TempDir;
-
-        use super::*;
-        use crate::Directory;
-
-        #[test]
-        fn test_index_on_commit_reload_policy_mmap() -> crate::Result<()> {
-            let schema = throw_away_schema();
-            let field = schema.get_field("num_likes").unwrap();
-            let tempdir = TempDir::new().unwrap();
-            let tempdir_path = PathBuf::from(tempdir.path());
-            let index = Index::create_in_dir(tempdir_path, schema).unwrap();
-            let reader = index
-                .reader_builder()
-                .reload_policy(ReloadPolicy::OnCommit)
-                .try_into()
-                .unwrap();
-            assert_eq!(reader.searcher().num_docs(), 0);
-            test_index_on_commit_reload_policy_aux(field, &index, &reader)
-        }
-
-        #[test]
-        fn test_index_manual_policy_mmap() -> crate::Result<()> {
-            let schema = throw_away_schema();
-            let field = schema.get_field("num_likes").unwrap();
-            let mut index = Index::create_from_tempdir(schema)?;
-            let mut writer = index.writer_for_tests()?;
-            writer.commit()?;
-            let reader = index
-                .reader_builder()
-                .reload_policy(ReloadPolicy::Manual)
-                .try_into()?;
-            assert_eq!(reader.searcher().num_docs(), 0);
-            writer.add_document(doc!(field=>1u64))?;
-            let (sender, receiver) = crossbeam_channel::unbounded();
-            let _handle = index.directory_mut().watch(WatchCallback::new(move || {
-                let _ = sender.send(());
-            }));
-            writer.commit()?;
-            assert!(receiver.recv().is_ok());
-            assert_eq!(reader.searcher().num_docs(), 0);
-            reader.reload()?;
-            assert_eq!(reader.searcher().num_docs(), 1);
-            Ok(())
-        }
-
-        #[test]
-        fn test_index_on_commit_reload_policy_different_directories() -> crate::Result<()> {
-            let schema = throw_away_schema();
-            let field = schema.get_field("num_likes").unwrap();
-            let tempdir = TempDir::new().unwrap();
-            let tempdir_path = PathBuf::from(tempdir.path());
-            let write_index = Index::create_in_dir(&tempdir_path, schema).unwrap();
-            let read_index = Index::open_in_dir(&tempdir_path).unwrap();
-            let reader = read_index
-                .reader_builder()
-                .reload_policy(ReloadPolicy::OnCommit)
-                .try_into()
-                .unwrap();
-            assert_eq!(reader.searcher().num_docs(), 0);
-            test_index_on_commit_reload_policy_aux(field, &write_index, &reader)
-        }
-    }
-    fn test_index_on_commit_reload_policy_aux(
-        field: Field,
-        index: &Index,
-        reader: &IndexReader,
-    ) -> crate::Result<()> {
-        let mut reader_index = reader.index();
-        let (sender, receiver) = crossbeam_channel::unbounded();
-        let _watch_handle = reader_index
-            .directory_mut()
-            .watch(WatchCallback::new(move || {
-                let _ = sender.send(());
-            }));
-        let mut writer = index.writer_for_tests()?;
-        assert_eq!(reader.searcher().num_docs(), 0);
-        writer.add_document(doc!(field=>1u64))?;
-        writer.commit().unwrap();
-        // We need a loop here because it is possible for notify to send more than
-        // one modify event. It was observed on CI on MacOS.
-        loop {
-            assert!(receiver.recv().is_ok());
-            if reader.searcher().num_docs() == 1 {
-                break;
-            }
-        }
-        writer.add_document(doc!(field=>2u64))?;
-        writer.commit().unwrap();
-        // ... Same as above
-        loop {
-            assert!(receiver.recv().is_ok());
-            if reader.searcher().num_docs() == 2 {
-                break;
-            }
-        }
-        Ok(())
-    }
-
-    // This test will not pass on windows, because windows
-    // prevent deleting files that are MMapped.
-    #[cfg(not(target_os = "windows"))]
-    #[test]
-    fn garbage_collect_works_as_intended() -> crate::Result<()> {
-        let directory = RamDirectory::create();
-        let schema = throw_away_schema();
-        let field = schema.get_field("num_likes").unwrap();
-        let index = Index::create(directory.clone(), schema, IndexSettings::default())?;
-
-        let mut writer = index.writer_with_num_threads(8, 24_000_000).unwrap();
-        for i in 0u64..8_000u64 {
-            writer.add_document(doc!(field => i))?;
-        }
-
-        writer.commit()?;
-        let mem_right_after_commit = directory.total_mem_usage();
-
-        let reader = index
-            .reader_builder()
-            .reload_policy(ReloadPolicy::Manual)
-            .try_into()?;
-        assert_eq!(reader.searcher().num_docs(), 8_000);
-        assert_eq!(reader.searcher().segment_readers().len(), 8);
-
-        writer.wait_merging_threads()?;
-
-        let mem_right_after_merge_finished = directory.total_mem_usage();
-
-        reader.reload().unwrap();
-        let searcher = reader.searcher();
-        assert_eq!(searcher.segment_readers().len(), 1);
-        assert_eq!(searcher.num_docs(), 8_000);
-        assert!(
-            mem_right_after_merge_finished < mem_right_after_commit,
-            "(mem after merge){} is expected < (mem before merge){}",
-            mem_right_after_merge_finished,
-            mem_right_after_commit
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_single_segment_index_writer() -> crate::Result<()> {
-        let mut schema_builder = Schema::builder();
-        let text_field = schema_builder.add_text_field("text", TEXT);
-        let schema = schema_builder.build();
-        let directory = RamDirectory::default();
-        let mut single_segment_index_writer = Index::builder()
-            .schema(schema)
-            .single_segment_index_writer(directory, 10_000_000)?;
-        for _ in 0..10 {
-            let doc = doc!(text_field=>"hello");
-            single_segment_index_writer.add_document(doc)?;
-        }
-        let index = single_segment_index_writer.finalize()?;
-        let searcher = index.reader()?.searcher();
-        let term_query = TermQuery::new(
-            Term::from_field_text(text_field, "hello"),
-            IndexRecordOption::Basic,
-        );
-        let count = searcher.search(&term_query, &Count)?;
-        assert_eq!(count, 10);
-        Ok(())
     }
 }

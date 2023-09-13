@@ -1,333 +1,208 @@
 #![warn(missing_docs)]
-#![cfg_attr(all(feature = "unstable", test), feature(test))]
 
 //! # `fastfield_codecs`
 //!
-//! - Columnar storage of data for tantivy [`Column`].
+//! - Columnar storage of data for tantivy [`crate::Column`].
 //! - Encode data in different codecs.
 //! - Monotonically map values to u64/u128
 
-#[cfg(test)]
-mod tests;
-
-use std::io;
-use std::io::Write;
+use std::fmt::Debug;
+use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
 
-use common::{BinarySerializable, OwnedBytes};
-use compact_space::CompactSpaceDecompressor;
-use monotonic_mapping::{
-    StrictlyMonotonicMappingInverter, StrictlyMonotonicMappingToInternal,
-    StrictlyMonotonicMappingToInternalBaseval, StrictlyMonotonicMappingToInternalGCDBaseval,
-};
-use serialize::{Header, U128Header};
+pub use monotonic_mapping::{MonotonicallyMappableToU64, StrictlyMonotonicFn};
+pub use monotonic_mapping_u128::MonotonicallyMappableToU128;
 
-mod bitpacked;
-mod blockwise_linear;
-mod compact_space;
-mod line;
-mod linear;
+mod merge;
 pub(crate) mod monotonic_mapping;
-// mod monotonic_mapping_u128;
+pub(crate) mod monotonic_mapping_u128;
+mod stats;
+mod u128_based;
+mod u64_based;
+mod vec_column;
 
-mod column;
-mod column_with_cardinality;
-mod gcd;
-pub mod serialize;
+mod monotonic_column;
 
-pub use self::column::{monotonic_map_column, ColumnValues, IterColumn, VecColumn};
-pub use self::monotonic_mapping::{MonotonicallyMappableToU64, StrictlyMonotonicFn};
-// pub use self::monotonic_mapping_u128::MonotonicallyMappableToU128;
-pub use self::serialize::{serialize_and_load, serialize_column_values, NormalizedHeader};
-use crate::column_values::bitpacked::BitpackedCodec;
-use crate::column_values::blockwise_linear::BlockwiseLinearCodec;
-use crate::column_values::linear::LinearCodec;
+pub(crate) use merge::MergedColumnValues;
+pub use stats::ColumnStats;
+pub use u128_based::{open_u128_mapped, serialize_column_values_u128};
+pub use u64_based::{
+    load_u64_based_column_values, serialize_and_load_u64_based_column_values,
+    serialize_u64_based_column_values, CodecType, ALL_U64_CODEC_TYPES,
+};
+pub use vec_column::VecColumn;
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Clone, Copy)]
-#[repr(u8)]
-/// Available codecs to use to encode the u64 (via [`MonotonicallyMappableToU64`]) converted data.
-pub enum FastFieldCodecType {
-    /// Bitpack all values in the value range. The number of bits is defined by the amplitude
-    /// `column.max_value() - column.min_value()`
-    Bitpacked = 1,
-    /// Linear interpolation puts a line between the first and last value and then bitpacks the
-    /// values by the offset from the line. The number of bits is defined by the max deviation from
-    /// the line.
-    Linear = 2,
-    /// Same as [`FastFieldCodecType::Linear`], but encodes in blocks of 512 elements.
-    BlockwiseLinear = 3,
-}
+pub use self::monotonic_column::monotonic_map_column;
+use crate::RowId;
 
-impl BinarySerializable for FastFieldCodecType {
-    fn serialize<W: Write>(&self, wrt: &mut W) -> io::Result<()> {
-        self.to_code().serialize(wrt)
-    }
+/// `ColumnValues` provides access to a dense field column.
+///
+/// `Column` are just a wrapper over `ColumnValues` and a `ColumnIndex`.
+///
+/// Any methods with a default and specialized implementation need to be called in the
+/// wrappers that implement the trait: Arc and MonotonicMappingColumn
+pub trait ColumnValues<T: PartialOrd = u64>: Send + Sync {
+    /// Return the value associated with the given idx.
+    ///
+    /// This accessor should return as fast as possible.
+    ///
+    /// # Panics
+    ///
+    /// May panic if `idx` is greater than the column length.
+    fn get_val(&self, idx: u32) -> T;
 
-    fn deserialize<R: io::Read>(reader: &mut R) -> io::Result<Self> {
-        let code = u8::deserialize(reader)?;
-        let codec_type: Self = Self::from_code(code)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Unknown code `{code}.`"))?;
-        Ok(codec_type)
-    }
-}
+    /// Allows to push down multiple fetch calls, to avoid dynamic dispatch overhead.
+    ///
+    /// idx and output should have the same length
+    ///
+    /// # Panics
+    ///
+    /// May panic if `idx` is greater than the column length.
+    fn get_vals(&self, indexes: &[u32], output: &mut [T]) {
+        assert!(indexes.len() == output.len());
+        let out_and_idx_chunks = output.chunks_exact_mut(4).zip(indexes.chunks_exact(4));
+        for (out_x4, idx_x4) in out_and_idx_chunks {
+            out_x4[0] = self.get_val(idx_x4[0]);
+            out_x4[1] = self.get_val(idx_x4[1]);
+            out_x4[2] = self.get_val(idx_x4[2]);
+            out_x4[3] = self.get_val(idx_x4[3]);
+        }
 
-impl FastFieldCodecType {
-    pub(crate) fn to_code(self) -> u8 {
-        self as u8
-    }
+        let step_size = 4;
+        let cutoff = indexes.len() - indexes.len() % step_size;
 
-    pub(crate) fn from_code(code: u8) -> Option<Self> {
-        match code {
-            1 => Some(Self::Bitpacked),
-            2 => Some(Self::Linear),
-            3 => Some(Self::BlockwiseLinear),
-            _ => None,
+        for idx in cutoff..indexes.len() {
+            output[idx] = self.get_val(indexes[idx]);
         }
     }
-}
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Clone, Copy)]
-#[repr(u8)]
-/// Available codecs to use to encode the u128 (via [`MonotonicallyMappableToU128`]) converted data.
-pub enum U128FastFieldCodecType {
-    /// This codec takes a large number space (u128) and reduces it to a compact number space, by
-    /// removing the holes.
-    CompactSpace = 1,
-}
-
-impl BinarySerializable for U128FastFieldCodecType {
-    fn serialize<W: Write>(&self, wrt: &mut W) -> io::Result<()> {
-        self.to_code().serialize(wrt)
-    }
-
-    fn deserialize<R: io::Read>(reader: &mut R) -> io::Result<Self> {
-        let code = u8::deserialize(reader)?;
-        let codec_type: Self = Self::from_code(code)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Unknown code `{code}.`"))?;
-        Ok(codec_type)
-    }
-}
-
-impl U128FastFieldCodecType {
-    pub(crate) fn to_code(self) -> u8 {
-        self as u8
-    }
-
-    pub(crate) fn from_code(code: u8) -> Option<Self> {
-        match code {
-            1 => Some(Self::CompactSpace),
-            _ => None,
+    /// Fills an output buffer with the fast field values
+    /// associated with the `DocId` going from
+    /// `start` to `start + output.len()`.
+    ///
+    /// # Panics
+    ///
+    /// Must panic if `start + output.len()` is greater than
+    /// the segment's `maxdoc`.
+    #[inline(always)]
+    fn get_range(&self, start: u64, output: &mut [T]) {
+        for (out, idx) in output.iter_mut().zip(start..) {
+            *out = self.get_val(idx as u32);
         }
     }
-}
 
-/// Returns the correct codec reader wrapped in the `Arc` for the data.
-// pub fn open_u128<Item: MonotonicallyMappableToU128>(
-//     bytes: OwnedBytes,
-// ) -> io::Result<Arc<dyn Column<Item>>> {
-//     todo!();
-//     // let (bytes, _format_version) = read_format_version(bytes)?;
-//     // let (mut bytes, _null_index_footer) = read_null_index_footer(bytes)?;
-//     // let header = U128Header::deserialize(&mut bytes)?;
-//     // assert_eq!(header.codec_type, U128FastFieldCodecType::CompactSpace);
-//     // let reader = CompactSpaceDecompressor::open(bytes)?;
-//     // let inverted: StrictlyMonotonicMappingInverter<StrictlyMonotonicMappingToInternal<Item>> =
-//     //     StrictlyMonotonicMappingToInternal::<Item>::new().into();
-//     // Ok(Arc::new(monotonic_map_column(reader, inverted)))
-// }
-
-/// Returns the correct codec reader wrapped in the `Arc` for the data.
-pub fn open_u64_mapped<T: MonotonicallyMappableToU64>(
-    mut bytes: OwnedBytes,
-) -> io::Result<Arc<dyn ColumnValues<T>>> {
-    let header = Header::deserialize(&mut bytes)?;
-    match header.codec_type {
-        FastFieldCodecType::Bitpacked => open_specific_codec::<BitpackedCodec, _>(bytes, &header),
-        FastFieldCodecType::Linear => open_specific_codec::<LinearCodec, _>(bytes, &header),
-        FastFieldCodecType::BlockwiseLinear => {
-            open_specific_codec::<BlockwiseLinearCodec, _>(bytes, &header)
+    /// Get the row ids of values which are in the provided value range.
+    ///
+    /// Note that position == docid for single value fast fields
+    fn get_row_ids_for_value_range(
+        &self,
+        value_range: RangeInclusive<T>,
+        row_id_range: Range<RowId>,
+        row_id_hits: &mut Vec<RowId>,
+    ) {
+        let row_id_range = row_id_range.start..row_id_range.end.min(self.num_vals());
+        for idx in row_id_range.start..row_id_range.end {
+            let val = self.get_val(idx);
+            if value_range.contains(&val) {
+                row_id_hits.push(idx);
+            }
         }
     }
-}
 
-fn open_specific_codec<C: FastFieldCodec, Item: MonotonicallyMappableToU64>(
-    bytes: OwnedBytes,
-    header: &Header,
-) -> io::Result<Arc<dyn ColumnValues<Item>>> {
-    let normalized_header = header.normalized();
-    let reader = C::open_from_bytes(bytes, normalized_header)?;
-    let min_value = header.min_value;
-    if let Some(gcd) = header.gcd {
-        let mapping = StrictlyMonotonicMappingInverter::from(
-            StrictlyMonotonicMappingToInternalGCDBaseval::new(gcd.get(), min_value),
-        );
-        Ok(Arc::new(monotonic_map_column(reader, mapping)))
-    } else {
-        let mapping = StrictlyMonotonicMappingInverter::from(
-            StrictlyMonotonicMappingToInternalBaseval::new(min_value),
-        );
-        Ok(Arc::new(monotonic_map_column(reader, mapping)))
+    /// Returns a lower bound for this column of values.
+    ///
+    /// All values are guaranteed to be higher than `.min_value()`
+    /// but this value is not necessary the best boundary value.
+    ///
+    /// We have
+    /// ∀i < self.num_vals(), self.get_val(i) >= self.min_value()
+    /// But we don't have necessarily
+    /// ∃i < self.num_vals(), self.get_val(i) == self.min_value()
+    fn min_value(&self) -> T;
+
+    /// Returns an upper bound for this column of values.
+    ///
+    /// All values are guaranteed to be lower than `.max_value()`
+    /// but this value is not necessary the best boundary value.
+    ///
+    /// We have
+    /// ∀i < self.num_vals(), self.get_val(i) <= self.max_value()
+    /// But we don't have necessarily
+    /// ∃i < self.num_vals(), self.get_val(i) == self.max_value()
+    fn max_value(&self) -> T;
+
+    /// The number of values in the column.
+    fn num_vals(&self) -> u32;
+
+    /// Returns a iterator over the data
+    fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = T> + 'a> {
+        Box::new((0..self.num_vals()).map(|idx| self.get_val(idx)))
     }
 }
 
-/// The FastFieldSerializerEstimate trait is required on all variants
-/// of fast field compressions, to decide which one to choose.
-pub(crate) trait FastFieldCodec: 'static {
-    /// A codex needs to provide a unique name and id, which is
-    /// used for debugging and de/serialization.
-    const CODEC_TYPE: FastFieldCodecType;
+/// Empty column of values.
+pub struct EmptyColumnValues;
 
-    type Reader: ColumnValues<u64> + 'static;
+impl<T: PartialOrd + Default> ColumnValues<T> for EmptyColumnValues {
+    fn get_val(&self, _idx: u32) -> T {
+        panic!("Internal Error: Called get_val of empty column.")
+    }
 
-    /// Reads the metadata and returns the CodecReader
-    fn open_from_bytes(bytes: OwnedBytes, header: NormalizedHeader) -> io::Result<Self::Reader>;
+    fn min_value(&self) -> T {
+        T::default()
+    }
 
-    /// Serializes the data using the serializer into write.
-    ///
-    /// The column iterator should be preferred over using column `get_val` method for
-    /// performance reasons.
-    fn serialize(column: &dyn ColumnValues, write: &mut impl Write) -> io::Result<()>;
+    fn max_value(&self) -> T {
+        T::default()
+    }
 
-    /// Returns an estimate of the compression ratio.
-    /// If the codec is not applicable, returns `None`.
-    ///
-    /// The baseline is uncompressed 64bit data.
-    ///
-    /// It could make sense to also return a value representing
-    /// computational complexity.
-    fn estimate(column: &dyn ColumnValues) -> Option<f32>;
+    fn num_vals(&self) -> u32 {
+        0
+    }
 }
 
-/// The list of all available codecs for u64 convertible data.
-pub const ALL_CODEC_TYPES: [FastFieldCodecType; 3] = [
-    FastFieldCodecType::Bitpacked,
-    FastFieldCodecType::BlockwiseLinear,
-    FastFieldCodecType::Linear,
-];
+impl<T: Copy + PartialOrd + Debug> ColumnValues<T> for Arc<dyn ColumnValues<T>> {
+    #[inline(always)]
+    fn get_val(&self, idx: u32) -> T {
+        self.as_ref().get_val(idx)
+    }
+
+    #[inline(always)]
+    fn min_value(&self) -> T {
+        self.as_ref().min_value()
+    }
+
+    #[inline(always)]
+    fn max_value(&self) -> T {
+        self.as_ref().max_value()
+    }
+
+    #[inline(always)]
+    fn num_vals(&self) -> u32 {
+        self.as_ref().num_vals()
+    }
+
+    #[inline(always)]
+    fn iter<'b>(&'b self) -> Box<dyn Iterator<Item = T> + 'b> {
+        self.as_ref().iter()
+    }
+
+    #[inline(always)]
+    fn get_range(&self, start: u64, output: &mut [T]) {
+        self.as_ref().get_range(start, output)
+    }
+
+    #[inline(always)]
+    fn get_row_ids_for_value_range(
+        &self,
+        range: RangeInclusive<T>,
+        doc_id_range: Range<u32>,
+        positions: &mut Vec<u32>,
+    ) {
+        self.as_ref()
+            .get_row_ids_for_value_range(range, doc_id_range, positions)
+    }
+}
 
 #[cfg(all(test, feature = "unstable"))]
-mod bench {
-    use std::sync::Arc;
-
-    use common::OwnedBytes;
-    use rand::rngs::StdRng;
-    use rand::{Rng, SeedableRng};
-    use test::{self, Bencher};
-
-    use super::*;
-
-    fn get_data() -> Vec<u64> {
-        let mut rng = StdRng::seed_from_u64(2u64);
-        let mut data: Vec<_> = (100..55000_u64)
-            .map(|num| num + rng.gen::<u8>() as u64)
-            .collect();
-        data.push(99_000);
-        data.insert(1000, 2000);
-        data.insert(2000, 100);
-        data.insert(3000, 4100);
-        data.insert(4000, 100);
-        data.insert(5000, 800);
-        data
-    }
-
-    #[inline(never)]
-    fn value_iter() -> impl Iterator<Item = u64> {
-        0..20_000
-    }
-    fn get_reader_for_bench<Codec: FastFieldCodec>(data: &[u64]) -> Codec::Reader {
-        let mut bytes = Vec::new();
-        let min_value = *data.iter().min().unwrap();
-        let data = data.iter().map(|el| *el - min_value).collect::<Vec<_>>();
-        let col = VecColumn::from(&data);
-        let normalized_header = NormalizedHeader {
-            num_vals: col.num_vals(),
-            max_value: col.max_value(),
-        };
-        Codec::serialize(&VecColumn::from(&data), &mut bytes).unwrap();
-        Codec::open_from_bytes(OwnedBytes::new(bytes), normalized_header).unwrap()
-    }
-    fn bench_get<Codec: FastFieldCodec>(b: &mut Bencher, data: &[u64]) {
-        let col = get_reader_for_bench::<Codec>(data);
-        b.iter(|| {
-            let mut sum = 0u64;
-            for pos in value_iter() {
-                let val = col.get_val(pos as u32);
-                sum = sum.wrapping_add(val);
-            }
-            sum
-        });
-    }
-
-    #[inline(never)]
-    fn bench_get_dynamic_helper(b: &mut Bencher, col: Arc<dyn ColumnValues>) {
-        b.iter(|| {
-            let mut sum = 0u64;
-            for pos in value_iter() {
-                let val = col.get_val(pos as u32);
-                sum = sum.wrapping_add(val);
-            }
-            sum
-        });
-    }
-
-    fn bench_get_dynamic<Codec: FastFieldCodec>(b: &mut Bencher, data: &[u64]) {
-        let col = Arc::new(get_reader_for_bench::<Codec>(data));
-        bench_get_dynamic_helper(b, col);
-    }
-    fn bench_create<Codec: FastFieldCodec>(b: &mut Bencher, data: &[u64]) {
-        let min_value = *data.iter().min().unwrap();
-        let data = data.iter().map(|el| *el - min_value).collect::<Vec<_>>();
-
-        let mut bytes = Vec::new();
-        b.iter(|| {
-            bytes.clear();
-            Codec::serialize(&VecColumn::from(&data), &mut bytes).unwrap();
-        });
-    }
-
-    #[bench]
-    fn bench_fastfield_bitpack_create(b: &mut Bencher) {
-        let data: Vec<_> = get_data();
-        bench_create::<BitpackedCodec>(b, &data);
-    }
-    #[bench]
-    fn bench_fastfield_linearinterpol_create(b: &mut Bencher) {
-        let data: Vec<_> = get_data();
-        bench_create::<LinearCodec>(b, &data);
-    }
-    #[bench]
-    fn bench_fastfield_multilinearinterpol_create(b: &mut Bencher) {
-        let data: Vec<_> = get_data();
-        bench_create::<BlockwiseLinearCodec>(b, &data);
-    }
-    #[bench]
-    fn bench_fastfield_bitpack_get(b: &mut Bencher) {
-        let data: Vec<_> = get_data();
-        bench_get::<BitpackedCodec>(b, &data);
-    }
-    #[bench]
-    fn bench_fastfield_bitpack_get_dynamic(b: &mut Bencher) {
-        let data: Vec<_> = get_data();
-        bench_get_dynamic::<BitpackedCodec>(b, &data);
-    }
-    #[bench]
-    fn bench_fastfield_linearinterpol_get(b: &mut Bencher) {
-        let data: Vec<_> = get_data();
-        bench_get::<LinearCodec>(b, &data);
-    }
-    #[bench]
-    fn bench_fastfield_linearinterpol_get_dynamic(b: &mut Bencher) {
-        let data: Vec<_> = get_data();
-        bench_get_dynamic::<LinearCodec>(b, &data);
-    }
-    #[bench]
-    fn bench_fastfield_multilinearinterpol_get(b: &mut Bencher) {
-        let data: Vec<_> = get_data();
-        bench_get::<BlockwiseLinearCodec>(b, &data);
-    }
-    #[bench]
-    fn bench_fastfield_multilinearinterpol_get_dynamic(b: &mut Bencher) {
-        let data: Vec<_> = get_data();
-        bench_get_dynamic::<BlockwiseLinearCodec>(b, &data);
-    }
-}
+mod bench;

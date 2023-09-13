@@ -21,7 +21,7 @@ struct TermInfoBlockMeta {
 }
 
 impl BinarySerializable for TermInfoBlockMeta {
-    fn serialize<W: Write>(&self, write: &mut W) -> io::Result<()> {
+    fn serialize<W: Write + ?Sized>(&self, write: &mut W) -> io::Result<()> {
         self.offset.serialize(write)?;
         self.ref_term_info.serialize(write)?;
         write.write_all(&[
@@ -272,7 +272,7 @@ impl TermInfoStoreWriter {
         Ok(())
     }
 
-    pub fn serialize<W: io::Write>(&mut self, write: &mut W) -> io::Result<()> {
+    pub fn serialize<W: io::Write + ?Sized>(&mut self, write: &mut W) -> io::Result<()> {
         if !self.term_infos.is_empty() {
             self.flush_block()?;
         }
@@ -312,7 +312,7 @@ mod tests {
         bitpack.write(51, 6, &mut buffer).unwrap();
         assert_eq!(compute_num_bits(51), 6);
         bitpack.close(&mut buffer).unwrap();
-        assert_eq!(buffer.len(), 3 + 7);
+        assert_eq!(buffer.len(), 3);
         assert_eq!(extract_bits(&buffer[..], 0, 9), 321u64);
         assert_eq!(extract_bits(&buffer[..], 9, 2), 2u64);
         assert_eq!(extract_bits(&buffer[..], 11, 6), 51u64);
@@ -359,8 +359,7 @@ mod tests {
             assert_eq!(
                 term_info_store.get(i as u64),
                 term_infos[i],
-                "term info {}",
-                i
+                "term info {i}"
             );
         }
         Ok(())

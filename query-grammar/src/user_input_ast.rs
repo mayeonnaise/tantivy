@@ -3,7 +3,7 @@ use std::fmt::{Debug, Formatter};
 
 use crate::Occur;
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone)]
 pub enum UserInputLeaf {
     Literal(UserInputLiteral),
     All,
@@ -18,8 +18,30 @@ pub enum UserInputLeaf {
     },
 }
 
+impl UserInputLeaf {
+    pub(crate) fn set_field(self, field: Option<String>) -> Self {
+        match self {
+            UserInputLeaf::Literal(mut literal) => {
+                literal.field_name = field;
+                UserInputLeaf::Literal(literal)
+            }
+            UserInputLeaf::All => UserInputLeaf::All,
+            UserInputLeaf::Range {
+                field: _,
+                lower,
+                upper,
+            } => UserInputLeaf::Range {
+                field,
+                lower,
+                upper,
+            },
+            UserInputLeaf::Set { field: _, elements } => UserInputLeaf::Set { field, elements },
+        }
+    }
+}
+
 impl Debug for UserInputLeaf {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> Result<(), fmt::Error> {
+    fn fmt(&self, formatter: &mut Formatter) -> Result<(), fmt::Error> {
         match self {
             UserInputLeaf::Literal(literal) => literal.fmt(formatter),
             UserInputLeaf::Range {
@@ -28,7 +50,8 @@ impl Debug for UserInputLeaf {
                 ref upper,
             } => {
                 if let Some(ref field) = field {
-                    write!(formatter, "\"{}\":", field)?;
+                    // TODO properly escape field (in case of \")
+                    write!(formatter, "\"{field}\":")?;
                 }
                 lower.display_lower(formatter)?;
                 write!(formatter, " TO ")?;
@@ -37,14 +60,16 @@ impl Debug for UserInputLeaf {
             }
             UserInputLeaf::Set { field, elements } => {
                 if let Some(ref field) = field {
-                    write!(formatter, "\"{}\": ", field)?;
+                    // TODO properly escape field (in case of \")
+                    write!(formatter, "\"{field}\": ")?;
                 }
                 write!(formatter, "IN [")?;
-                for (i, element) in elements.iter().enumerate() {
+                for (i, text) in elements.iter().enumerate() {
                     if i != 0 {
                         write!(formatter, " ")?;
                     }
-                    write!(formatter, "\"{}\"", element)?;
+                    // TODO properly escape element
+                    write!(formatter, "\"{text}\"")?;
                 }
                 write!(formatter, "]")
             }
@@ -53,27 +78,52 @@ impl Debug for UserInputLeaf {
     }
 }
 
-#[derive(PartialEq)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum Delimiter {
+    SingleQuotes,
+    DoubleQuotes,
+    None,
+}
+
+#[derive(PartialEq, Clone)]
 pub struct UserInputLiteral {
     pub field_name: Option<String>,
     pub phrase: String,
+    pub delimiter: Delimiter,
     pub slop: u32,
+    pub prefix: bool,
 }
 
 impl fmt::Debug for UserInputLiteral {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         if let Some(ref field) = self.field_name {
-            write!(formatter, "\"{}\":", field)?;
+            // TODO properly escape field (in case of \")
+            write!(formatter, "\"{field}\":")?;
         }
-        write!(formatter, "\"{}\"", self.phrase)?;
+        match self.delimiter {
+            Delimiter::SingleQuotes => {
+                // TODO properly escape element (in case of \')
+                write!(formatter, "'{}'", self.phrase)?;
+            }
+            Delimiter::DoubleQuotes => {
+                // TODO properly escape element (in case of \")
+                write!(formatter, "\"{}\"", self.phrase)?;
+            }
+            Delimiter::None => {
+                // TODO properly escape element
+                write!(formatter, "{}", self.phrase)?;
+            }
+        }
         if self.slop > 0 {
             write!(formatter, "~{}", self.slop)?;
+        } else if self.prefix {
+            write!(formatter, "*")?;
         }
         Ok(())
     }
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Debug, Clone)]
 pub enum UserInputBound {
     Inclusive(String),
     Exclusive(String),
@@ -83,16 +133,18 @@ pub enum UserInputBound {
 impl UserInputBound {
     fn display_lower(&self, formatter: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         match *self {
-            UserInputBound::Inclusive(ref word) => write!(formatter, "[\"{}\"", word),
-            UserInputBound::Exclusive(ref word) => write!(formatter, "{{\"{}\"", word),
+            // TODO properly escape word if required
+            UserInputBound::Inclusive(ref word) => write!(formatter, "[\"{word}\""),
+            UserInputBound::Exclusive(ref word) => write!(formatter, "{{\"{word}\""),
             UserInputBound::Unbounded => write!(formatter, "{{\"*\""),
         }
     }
 
     fn display_upper(&self, formatter: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         match *self {
-            UserInputBound::Inclusive(ref word) => write!(formatter, "\"{}\"]", word),
-            UserInputBound::Exclusive(ref word) => write!(formatter, "\"{}\"}}", word),
+            // TODO properly escape word if required
+            UserInputBound::Inclusive(ref word) => write!(formatter, "\"{word}\"]"),
+            UserInputBound::Exclusive(ref word) => write!(formatter, "\"{word}\"}}"),
             UserInputBound::Unbounded => write!(formatter, "\"*\"}}"),
         }
     }
@@ -106,6 +158,7 @@ impl UserInputBound {
     }
 }
 
+#[derive(PartialEq, Clone)]
 pub enum UserInputAst {
     Clause(Vec<(Option<Occur>, UserInputAst)>),
     Leaf(Box<UserInputLeaf>),
@@ -163,9 +216,9 @@ fn print_occur_ast(
     formatter: &mut fmt::Formatter,
 ) -> fmt::Result {
     if let Some(occur) = occur_opt {
-        write!(formatter, "{}{:?}", occur, ast)?;
+        write!(formatter, "{occur}{ast:?}")?;
     } else {
-        write!(formatter, "*{:?}", ast)?;
+        write!(formatter, "*{ast:?}")?;
     }
     Ok(())
 }
@@ -175,6 +228,7 @@ impl fmt::Debug for UserInputAst {
         match *self {
             UserInputAst::Clause(ref subqueries) => {
                 if subqueries.is_empty() {
+                    // TODO this will break ast reserialization, is writing "( )" enought?
                     write!(formatter, "<emptyclause>")?;
                 } else {
                     write!(formatter, "(")?;
@@ -187,8 +241,8 @@ impl fmt::Debug for UserInputAst {
                 }
                 Ok(())
             }
-            UserInputAst::Leaf(ref subquery) => write!(formatter, "{:?}", subquery),
-            UserInputAst::Boost(ref leaf, boost) => write!(formatter, "({:?})^{}", leaf, boost),
+            UserInputAst::Leaf(ref subquery) => write!(formatter, "{subquery:?}"),
+            UserInputAst::Boost(ref leaf, boost) => write!(formatter, "({leaf:?})^{boost}"),
         }
     }
 }

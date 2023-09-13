@@ -11,8 +11,8 @@ use crate::schema::{IndexRecordOption, Term};
 /// `Must` occurrence
 /// * match none of the sub queries associated with the
 /// `MustNot` occurrence.
-/// * match at least one of the subqueries that is not
-/// a `MustNot` occurrence.
+/// * match at least one of the sub queries associated
+/// with the `Must` or `Should` occurrence.
 ///
 ///
 /// You can combine other query types and their `Occur`ances into one `BooleanQuery`
@@ -32,7 +32,7 @@ use crate::schema::{IndexRecordOption, Term};
 ///    let schema = schema_builder.build();
 ///    let index = Index::create_in_ram(schema);
 ///    {
-///        let mut index_writer = index.writer(3_000_000)?;
+///        let mut index_writer = index.writer(15_000_000)?;
 ///        index_writer.add_document(doc!(
 ///            title => "The Name of the Wind",
 ///        ))?;

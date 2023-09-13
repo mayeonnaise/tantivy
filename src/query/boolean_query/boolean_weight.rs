@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 
 use crate::core::SegmentReader;
+use crate::docset::BUFFER_LEN;
 use crate::postings::FreqReadingOption;
 use crate::query::explanation::does_not_match;
 use crate::query::score_combiner::{DoNothingCombiner, ScoreCombiner};
 use crate::query::term_query::TermScorer;
-use crate::query::weight::{for_each_docset, for_each_pruning_scorer, for_each_scorer};
+use crate::query::weight::{for_each_docset_buffered, for_each_pruning_scorer, for_each_scorer};
 use crate::query::{
     intersect_scorers, EmptyScorer, Exclude, Explanation, Occur, RequiredOptionalScorer, Scorer,
     Union, Weight,
@@ -66,6 +67,7 @@ fn into_box_scorer<TScoreCombiner: ScoreCombiner>(
     }
 }
 
+/// Weight associated to the `BoolQuery`.
 pub struct BooleanWeight<TScoreCombiner: ScoreCombiner> {
     weights: Vec<(Occur, Box<dyn Weight>)>,
     scoring_enabled: bool,
@@ -73,6 +75,7 @@ pub struct BooleanWeight<TScoreCombiner: ScoreCombiner> {
 }
 
 impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
+    /// Creates a new boolean weight.
     pub fn new(
         weights: Vec<(Occur, Box<dyn Weight>)>,
         scoring_enabled: bool,
@@ -95,7 +98,7 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
             let sub_scorer: Box<dyn Scorer> = subweight.scorer(reader, boost)?;
             per_occur_scorers
                 .entry(*occur)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(sub_scorer);
         }
         Ok(per_occur_scorers)
@@ -190,7 +193,7 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
             return Ok(Explanation::new("BooleanQuery with no scoring", 1.0));
         }
 
-        let mut explanation = Explanation::new("BooleanClause. Sum of ...", scorer.score());
+        let mut explanation = Explanation::new("BooleanClause. sum of ...", scorer.score());
         for (occur, subweight) in &self.weights {
             if is_positive_occur(*occur) {
                 if let Ok(child_explanation) = subweight.explain(reader, doc) {
@@ -222,16 +225,18 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
     fn for_each_no_score(
         &self,
         reader: &SegmentReader,
-        callback: &mut dyn FnMut(DocId),
+        callback: &mut dyn FnMut(&[DocId]),
     ) -> crate::Result<()> {
         let scorer = self.complex_scorer(reader, 1.0, || DoNothingCombiner)?;
+        let mut buffer = [0u32; BUFFER_LEN];
+
         match scorer {
             SpecializedScorer::TermUnion(term_scorers) => {
                 let mut union_scorer = Union::build(term_scorers, &self.score_combiner_fn);
-                for_each_docset(&mut union_scorer, callback);
+                for_each_docset_buffered(&mut union_scorer, &mut buffer, callback);
             }
             SpecializedScorer::Other(mut scorer) => {
-                for_each_docset(scorer.as_mut(), callback);
+                for_each_docset_buffered(scorer.as_mut(), &mut buffer, callback);
             }
         }
         Ok(())

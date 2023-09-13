@@ -1,24 +1,28 @@
 use std::str::CharIndices;
 
-use super::{BoxTokenStream, Token, TokenStream, Tokenizer};
+use super::{Token, TokenStream, Tokenizer};
 
 /// Tokenize the text by splitting on whitespaces.
-#[derive(Clone)]
-pub struct WhitespaceTokenizer;
+#[derive(Clone, Default)]
+pub struct WhitespaceTokenizer {
+    token: Token,
+}
 
 pub struct WhitespaceTokenStream<'a> {
     text: &'a str,
     chars: CharIndices<'a>,
-    token: Token,
+    token: &'a mut Token,
 }
 
 impl Tokenizer for WhitespaceTokenizer {
-    fn token_stream<'a>(&self, text: &'a str) -> BoxTokenStream<'a> {
-        BoxTokenStream::from(WhitespaceTokenStream {
+    type TokenStream<'a> = WhitespaceTokenStream<'a>;
+    fn token_stream<'a>(&'a mut self, text: &'a str) -> WhitespaceTokenStream<'a> {
+        self.token.reset();
+        WhitespaceTokenStream {
             text,
             chars: text.char_indices(),
-            token: Token::default(),
-        })
+            token: &mut self.token,
+        }
     }
 }
 
@@ -50,11 +54,11 @@ impl<'a> TokenStream for WhitespaceTokenStream<'a> {
     }
 
     fn token(&self) -> &Token {
-        &self.token
+        self.token
     }
 
     fn token_mut(&mut self) -> &mut Token {
-        &mut self.token
+        self.token
     }
 }
 
@@ -74,7 +78,7 @@ mod tests {
     }
 
     fn token_stream_helper(text: &str) -> Vec<Token> {
-        let a = TextAnalyzer::from(WhitespaceTokenizer);
+        let mut a = TextAnalyzer::from(WhitespaceTokenizer::default());
         let mut token_stream = a.token_stream(text);
         let mut tokens: Vec<Token> = vec![];
         let mut add_token = |token: &Token| {

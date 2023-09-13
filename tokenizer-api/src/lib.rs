@@ -34,42 +34,51 @@ impl Default for Token {
             offset_from: 0,
             offset_to: 0,
             position: usize::MAX,
-            text: String::with_capacity(200),
+            text: String::new(),
             position_length: 1,
         }
     }
 }
 
-/// `Tokenizer` are in charge of splitting text into a stream of token
-/// before indexing.
-///
-/// # Warning
-///
-/// This API may change to use associated types.
-pub trait Tokenizer: 'static + Send + Sync + TokenizerClone {
-    /// Creates a token stream for a given `str`.
-    fn token_stream<'a>(&self, text: &'a str) -> BoxTokenStream<'a>;
-}
-
-pub trait TokenizerClone {
-    fn box_clone(&self) -> Box<dyn Tokenizer>;
-}
-
-impl<T: Tokenizer + Clone> TokenizerClone for T {
-    fn box_clone(&self) -> Box<dyn Tokenizer> {
-        Box::new(self.clone())
+impl Token {
+    /// reset to default
+    pub fn reset(&mut self) {
+        self.offset_from = 0;
+        self.offset_to = 0;
+        self.position = usize::MAX;
+        self.text.clear();
+        self.position_length = 1;
     }
 }
 
+/// `Tokenizer` are in charge of splitting text into a stream of token
+/// before indexing.
+pub trait Tokenizer: 'static + Clone + Send + Sync {
+    /// The token stream returned by this Tokenizer.
+    type TokenStream<'a>: TokenStream;
+    /// Creates a token stream for a given `str`.
+    fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a>;
+}
+
 /// Simple wrapper of `Box<dyn TokenStream + 'a>`.
-///
-/// See [`TokenStream`] for more information.
 pub struct BoxTokenStream<'a>(Box<dyn TokenStream + 'a>);
 
-impl<'a, T> From<T> for BoxTokenStream<'a>
-where T: TokenStream + 'a
-{
-    fn from(token_stream: T) -> BoxTokenStream<'a> {
+impl<'a> TokenStream for BoxTokenStream<'a> {
+    fn advance(&mut self) -> bool {
+        self.0.advance()
+    }
+
+    fn token(&self) -> &Token {
+        self.0.token()
+    }
+
+    fn token_mut(&mut self) -> &mut Token {
+        self.0.token_mut()
+    }
+}
+
+impl<'a> BoxTokenStream<'a> {
+    pub fn new<T: TokenStream + 'a>(token_stream: T) -> BoxTokenStream<'a> {
         BoxTokenStream(Box::new(token_stream))
     }
 }
@@ -139,39 +148,13 @@ pub trait TokenStream {
     }
 }
 
-/// Simple wrapper of `Box<dyn TokenFilter + 'a>`.
-///
-/// See [`TokenFilter`] for more information.
-pub struct BoxTokenFilter(Box<dyn TokenFilter>);
-
-impl Deref for BoxTokenFilter {
-    type Target = dyn TokenFilter;
-
-    fn deref(&self) -> &dyn TokenFilter {
-        &*self.0
-    }
-}
-
-impl<T: TokenFilter> From<T> for BoxTokenFilter {
-    fn from(tokenizer: T) -> BoxTokenFilter {
-        BoxTokenFilter(Box::new(tokenizer))
-    }
-}
-
-pub trait TokenFilterClone {
-    fn box_clone(&self) -> BoxTokenFilter;
-}
-
 /// Trait for the pluggable components of `Tokenizer`s.
-pub trait TokenFilter: 'static + Send + Sync + TokenFilterClone {
-    /// Wraps a token stream and returns the modified one.
-    fn transform<'a>(&self, token_stream: BoxTokenStream<'a>) -> BoxTokenStream<'a>;
-}
-
-impl<T: TokenFilter + Clone> TokenFilterClone for T {
-    fn box_clone(&self) -> BoxTokenFilter {
-        BoxTokenFilter::from(self.clone())
-    }
+pub trait TokenFilter: 'static + Send + Sync {
+    /// The Tokenizer type returned by this filter, typically parametrized by the underlying
+    /// Tokenizer.
+    type Tokenizer<T: Tokenizer>: Tokenizer;
+    /// Wraps a Tokenizer and returns a new one.
+    fn transform<T: Tokenizer>(self, tokenizer: T) -> Self::Tokenizer<T>;
 }
 
 #[cfg(test)]

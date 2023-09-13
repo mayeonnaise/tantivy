@@ -4,7 +4,7 @@ use std::{fmt, io};
 
 use crate::collector::Collector;
 use crate::core::{Executor, SegmentReader};
-use crate::query::{EnableScoring, Query};
+use crate::query::{Bm25StatisticsProvider, EnableScoring, Query};
 use crate::schema::{Document, Schema, Term};
 use crate::space_usage::SearcherSpaceUsage;
 use crate::store::{CacheStats, StoreReader};
@@ -176,8 +176,27 @@ impl Searcher {
         query: &dyn Query,
         collector: &C,
     ) -> crate::Result<C::Fruit> {
+        self.search_with_statistics_provider(query, collector, self)
+    }
+
+    /// Same as [`search(...)`](Searcher::search) but allows specifying
+    /// a [Bm25StatisticsProvider].
+    ///
+    /// This can be used to adjust the statistics used in computing BM25
+    /// scores.
+    pub fn search_with_statistics_provider<C: Collector>(
+        &self,
+        query: &dyn Query,
+        collector: &C,
+        statistics_provider: &dyn Bm25StatisticsProvider,
+    ) -> crate::Result<C::Fruit> {
+        let enabled_scoring = if collector.requires_scoring() {
+            EnableScoring::enabled_from_statistics_provider(statistics_provider, self)
+        } else {
+            EnableScoring::disabled_from_searcher(self)
+        };
         let executor = self.inner.index.search_executor();
-        self.search_with_executor(query, collector, executor)
+        self.search_with_executor(query, collector, executor, enabled_scoring)
     }
 
     /// Same as [`search(...)`](Searcher::search) but multithreaded.
@@ -197,12 +216,8 @@ impl Searcher {
         query: &dyn Query,
         collector: &C,
         executor: &Executor,
+        enabled_scoring: EnableScoring,
     ) -> crate::Result<C::Fruit> {
-        let enabled_scoring = if collector.requires_scoring() {
-            EnableScoring::enabled_from_searcher(self)
-        } else {
-            EnableScoring::disabled_from_searcher(self)
-        };
         let weight = query.weight(enabled_scoring)?;
         let segment_readers = self.segment_readers();
         let fruits = executor.map(
@@ -249,7 +264,7 @@ impl SearcherInner {
         index: Index,
         segment_readers: Vec<SegmentReader>,
         generation: TrackedObject<SearcherGeneration>,
-        doc_store_cache_size: usize,
+        doc_store_cache_num_blocks: usize,
     ) -> io::Result<SearcherInner> {
         assert_eq!(
             &segment_readers
@@ -261,7 +276,7 @@ impl SearcherInner {
         );
         let store_readers: Vec<StoreReader> = segment_readers
             .iter()
-            .map(|segment_reader| segment_reader.get_store_reader(doc_store_cache_size))
+            .map(|segment_reader| segment_reader.get_store_reader(doc_store_cache_num_blocks))
             .collect::<io::Result<Vec<_>>>()?;
 
         Ok(SearcherInner {
@@ -281,6 +296,6 @@ impl fmt::Debug for Searcher {
             .iter()
             .map(SegmentReader::segment_id)
             .collect::<Vec<_>>();
-        write!(f, "Searcher({:?})", segment_ids)
+        write!(f, "Searcher({segment_ids:?})")
     }
 }

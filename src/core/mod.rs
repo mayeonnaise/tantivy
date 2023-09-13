@@ -2,6 +2,8 @@ mod executor;
 pub mod index;
 mod index_meta;
 mod inverted_index_reader;
+#[doc(hidden)]
+pub mod json_utils;
 pub mod searcher;
 mod segment;
 mod segment_component;
@@ -36,3 +38,6 @@ pub static META_FILEPATH: Lazy<&'static Path> = Lazy::new(|| Path::new("meta.jso
 /// Removing this file is safe, but will prevent the garbage collection of all of the file that
 /// are currently in the directory
 pub static MANAGED_FILEPATH: Lazy<&'static Path> = Lazy::new(|| Path::new(".managed.json"));
+
+#[cfg(test)]
+mod tests;

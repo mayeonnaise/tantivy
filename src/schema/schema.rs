@@ -159,10 +159,10 @@ impl SchemaBuilder {
     }
 
     /// Adds a facet field to the schema.
-    pub fn add_facet_field<T: Into<FacetOptions>>(
+    pub fn add_facet_field(
         &mut self,
         field_name: &str,
-        facet_options: T,
+        facet_options: impl Into<FacetOptions>,
     ) -> Field {
         let field_entry = FieldEntry::new_facet(field_name.to_string(), facet_options.into());
         self.add_field(field_entry)
@@ -410,6 +410,30 @@ impl Schema {
         }
         None
     }
+
+    /// Transforms a user-supplied fast field name into a column name.
+    ///
+    /// This is similar to `.find_field` except it includes some fallback logic to
+    /// a default json field. This functionality is used in Quickwit.
+    ///
+    /// If the remaining path is empty and seems to target JSON field, we return None.
+    /// If the remaining path is non-empty and seems to target a non-JSON field, we return None.
+    #[doc(hidden)]
+    pub fn find_field_with_default<'a>(
+        &self,
+        full_path: &'a str,
+        default_field_opt: Option<Field>,
+    ) -> Option<(Field, &'a str)> {
+        let (field, json_path) = self
+            .find_field(full_path)
+            .or(default_field_opt.map(|field| (field, full_path)))?;
+        let field_entry = self.get_field_entry(field);
+        let is_json = field_entry.field_type().value_type() == Type::Json;
+        if is_json == json_path.is_empty() {
+            return None;
+        }
+        Some((field, json_path))
+    }
 }
 
 impl Serialize for Schema {
@@ -484,15 +508,14 @@ mod tests {
     use serde_json;
 
     use crate::schema::field_type::ValueParsingError;
-    use crate::schema::numeric_options::Cardinality::SingleValue;
     use crate::schema::schema::DocParsingError::InvalidJson;
     use crate::schema::*;
 
     #[test]
     fn test_locate_splitting_dots() {
         assert_eq!(&super::locate_splitting_dots("a.b.c"), &[1, 3]);
-        assert_eq!(&super::locate_splitting_dots(r#"a\.b.c"#), &[4]);
-        assert_eq!(&super::locate_splitting_dots(r#"a\..b.c"#), &[3, 5]);
+        assert_eq!(&super::locate_splitting_dots(r"a\.b.c"), &[4]);
+        assert_eq!(&super::locate_splitting_dots(r"a\..b.c"), &[3, 5]);
     }
 
     #[test]
@@ -506,19 +529,13 @@ mod tests {
     #[test]
     pub fn test_schema_serialization() {
         let mut schema_builder = Schema::builder();
-        let count_options = NumericOptions::default()
-            .set_stored()
-            .set_fast(Cardinality::SingleValue);
-        let popularity_options = NumericOptions::default()
-            .set_stored()
-            .set_fast(Cardinality::SingleValue);
+        let count_options = NumericOptions::default().set_stored().set_fast();
+        let popularity_options = NumericOptions::default().set_stored().set_fast();
         let score_options = NumericOptions::default()
             .set_indexed()
             .set_fieldnorm()
-            .set_fast(Cardinality::SingleValue);
-        let is_read_options = NumericOptions::default()
-            .set_stored()
-            .set_fast(Cardinality::SingleValue);
+            .set_fast();
+        let is_read_options = NumericOptions::default().set_stored().set_fast();
         schema_builder.add_text_field("title", TEXT);
         schema_builder.add_text_field(
             "author",
@@ -567,7 +584,7 @@ mod tests {
     "options": {
       "indexed": false,
       "fieldnorms": false,
-      "fast": "single",
+      "fast": true,
       "stored": true
     }
   },
@@ -577,7 +594,7 @@ mod tests {
     "options": {
       "indexed": false,
       "fieldnorms": false,
-      "fast": "single",
+      "fast": true,
       "stored": true
     }
   },
@@ -587,7 +604,7 @@ mod tests {
     "options": {
       "indexed": true,
       "fieldnorms": true,
-      "fast": "single",
+      "fast": true,
       "stored": false
     }
   },
@@ -597,7 +614,7 @@ mod tests {
     "options": {
       "indexed": false,
       "fieldnorms": false,
-      "fast": "single",
+      "fast": true,
       "stored": true
     }
   }
@@ -643,12 +660,8 @@ mod tests {
     #[test]
     pub fn test_document_to_json() {
         let mut schema_builder = Schema::builder();
-        let count_options = NumericOptions::default()
-            .set_stored()
-            .set_fast(Cardinality::SingleValue);
-        let is_read_options = NumericOptions::default()
-            .set_stored()
-            .set_fast(Cardinality::SingleValue);
+        let count_options = NumericOptions::default().set_stored().set_fast();
+        let is_read_options = NumericOptions::default().set_stored().set_fast();
         schema_builder.add_text_field("title", TEXT);
         schema_builder.add_text_field("author", STRING);
         schema_builder.add_u64_field("count", count_options);
@@ -748,15 +761,9 @@ mod tests {
     #[test]
     pub fn test_parse_document() {
         let mut schema_builder = Schema::builder();
-        let count_options = NumericOptions::default()
-            .set_stored()
-            .set_fast(Cardinality::SingleValue);
-        let popularity_options = NumericOptions::default()
-            .set_stored()
-            .set_fast(Cardinality::SingleValue);
-        let score_options = NumericOptions::default()
-            .set_indexed()
-            .set_fast(Cardinality::SingleValue);
+        let count_options = NumericOptions::default().set_stored().set_fast();
+        let popularity_options = NumericOptions::default().set_stored().set_fast();
+        let score_options = NumericOptions::default().set_indexed().set_fast();
         let title_field = schema_builder.add_text_field("title", TEXT);
         let author_field = schema_builder.add_text_field("author", STRING);
         let count_field = schema_builder.add_u64_field("count", count_options);
@@ -907,7 +914,7 @@ mod tests {
             .set_stored()
             .set_indexed()
             .set_fieldnorm()
-            .set_fast(SingleValue);
+            .set_fast();
         schema_builder.add_text_field("_id", id_options);
         schema_builder.add_date_field("_timestamp", timestamp_options);
 
@@ -931,7 +938,7 @@ mod tests {
     "options": {
       "indexed": false,
       "fieldnorms": false,
-      "fast": "single",
+      "fast": true,
       "stored": true
     }
   }
@@ -964,7 +971,7 @@ mod tests {
     "options": {
       "indexed": true,
       "fieldnorms": true,
-      "fast": "single",
+      "fast": true,
       "stored": true,
       "precision": "seconds"
     }
@@ -988,7 +995,7 @@ mod tests {
     "options": {
       "indexed": false,
       "fieldnorms": false,
-      "fast": "single",
+      "fast": true,
       "stored": true
     }
   }

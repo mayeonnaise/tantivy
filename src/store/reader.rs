@@ -5,7 +5,7 @@ use std::ops::{AddAssign, Range};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use common::{BinarySerializable, HasLen, OwnedBytes};
+use common::{BinarySerializable, OwnedBytes};
 use lru::LruCache;
 
 use super::footer::DocStoreFooter;
@@ -114,19 +114,23 @@ impl Sum for CacheStats {
 
 impl StoreReader {
     /// Opens a store reader
-    pub fn open(store_file: FileSlice, cache_size: usize) -> io::Result<StoreReader> {
+    ///
+    /// `cache_num_blocks` sets the number of decompressed blocks to be cached in an LRU.
+    /// The size of blocks is configurable, this should be reflexted in the
+    pub fn open(store_file: FileSlice, cache_num_blocks: usize) -> io::Result<StoreReader> {
         let (footer, data_and_offset) = DocStoreFooter::extract_footer(store_file)?;
 
         let (data_file, offset_index_file) = data_and_offset.split(footer.offset as usize);
         let index_data = offset_index_file.read_bytes()?;
-        let space_usage = StoreSpaceUsage::new(data_file.len(), offset_index_file.len());
+        let space_usage =
+            StoreSpaceUsage::new(data_file.num_bytes(), offset_index_file.num_bytes());
         let skip_index = SkipIndex::open(index_data);
         Ok(StoreReader {
             decompressor: footer.decompressor,
             data: data_file,
             cache: BlockCache {
-                cache: NonZeroUsize::new(cache_size)
-                    .map(|cache_size| Mutex::new(LruCache::new(cache_size))),
+                cache: NonZeroUsize::new(cache_num_blocks)
+                    .map(|cache_num_blocks| Mutex::new(LruCache::new(cache_num_blocks))),
                 cache_hits: Default::default(),
                 cache_misses: Default::default(),
             },
@@ -154,7 +158,7 @@ impl StoreReader {
     /// Advanced API. In most cases use [`get`](Self::get).
     fn block_checkpoint(&self, doc_id: DocId) -> crate::Result<Checkpoint> {
         self.skip_index.seek(doc_id).ok_or_else(|| {
-            crate::TantivyError::InvalidArgument(format!("Failed to lookup Doc #{}.", doc_id))
+            crate::TantivyError::InvalidArgument(format!("Failed to lookup Doc #{doc_id}."))
         })
     }
 
@@ -422,7 +426,7 @@ mod tests {
         assert_eq!(store.cache_stats().cache_hits, 1);
         assert_eq!(store.cache_stats().cache_misses, 2);
 
-        assert_eq!(store.cache.peek_lru(), Some(11163));
+        assert_eq!(store.cache.peek_lru(), Some(11207));
 
         Ok(())
     }

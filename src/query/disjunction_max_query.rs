@@ -1,6 +1,4 @@
-use tantivy_query_grammar::Occur;
-
-use crate::query::{BooleanWeight, DisjunctionMaxCombiner, EnableScoring, Query, Weight};
+use crate::query::{BooleanWeight, DisjunctionMaxCombiner, EnableScoring, Occur, Query, Weight};
 use crate::{Score, Term};
 
 /// The disjunction max query returns documents matching one or more wrapped queries,
@@ -25,7 +23,7 @@ use crate::{Score, Term};
 ///    let schema = schema_builder.build();
 ///    let index = Index::create_in_ram(schema);
 ///    {
-///        let mut index_writer = index.writer(3_000_000)?;
+///        let mut index_writer = index.writer(15_000_000)?;
 ///        index_writer.add_document(doc!(
 ///            title => "The Name of Girl",
 ///        ))?;

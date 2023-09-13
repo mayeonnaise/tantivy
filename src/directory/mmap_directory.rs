@@ -1,13 +1,13 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, Write};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, Weak};
-use std::{fmt, result};
 
 use common::StableDeref;
-use fs2::FileExt;
+use fs4::FileExt;
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
@@ -21,6 +21,8 @@ use crate::directory::{
     AntiCallToken, Directory, DirectoryLock, FileHandle, Lock, OwnedBytes, TerminatingWrite,
     WatchCallback, WatchHandle, WritePtr,
 };
+#[cfg(unix)]
+use crate::Advice;
 
 pub type ArcBytes = Arc<dyn Deref<Target = [u8]> + Send + Sync + 'static>;
 pub type WeakArcBytes = Weak<dyn Deref<Target = [u8]> + Send + Sync + 'static>;
@@ -32,7 +34,7 @@ pub(crate) fn make_io_err(msg: String) -> io::Error {
 
 /// Returns `None` iff the file exists, can be read, but is empty (and hence
 /// cannot be mmapped)
-fn open_mmap(full_path: &Path) -> result::Result<Option<Mmap>, OpenReadError> {
+fn open_mmap(full_path: &Path) -> Result<Option<Mmap>, OpenReadError> {
     let file = File::open(full_path).map_err(|io_err| {
         if io_err.kind() == io::ErrorKind::NotFound {
             OpenReadError::FileDoesNotExist(full_path.to_path_buf())
@@ -50,11 +52,13 @@ fn open_mmap(full_path: &Path) -> result::Result<Option<Mmap>, OpenReadError> {
         // instead.
         return Ok(None);
     }
-    unsafe {
+    let mmap_opt: Option<memmap2::Mmap> = unsafe {
         memmap2::Mmap::map(&file)
             .map(Some)
             .map_err(|io_err| OpenReadError::wrap_io_error(io_err, full_path.to_path_buf()))
-    }
+    }?;
+
+    Ok(mmap_opt)
 }
 
 #[derive(Default, Clone, Debug, Serialize, Deserialize)]
@@ -72,13 +76,28 @@ pub struct CacheInfo {
     pub mmapped: Vec<PathBuf>,
 }
 
-#[derive(Default)]
 struct MmapCache {
     counters: CacheCounters,
     cache: HashMap<PathBuf, WeakArcBytes>,
+    #[cfg(unix)]
+    madvice_opt: Option<Advice>,
 }
 
 impl MmapCache {
+    fn new() -> MmapCache {
+        MmapCache {
+            counters: CacheCounters::default(),
+            cache: HashMap::default(),
+            #[cfg(unix)]
+            madvice_opt: None,
+        }
+    }
+
+    #[cfg(unix)]
+    fn set_advice(&mut self, madvice: Advice) {
+        self.madvice_opt = Some(madvice);
+    }
+
     fn get_info(&self) -> CacheInfo {
         let paths: Vec<PathBuf> = self.cache.keys().cloned().collect();
         CacheInfo {
@@ -99,6 +118,16 @@ impl MmapCache {
         }
     }
 
+    fn open_mmap_impl(&self, full_path: &Path) -> Result<Option<Mmap>, OpenReadError> {
+        let mmap_opt = open_mmap(full_path)?;
+        #[cfg(unix)]
+        if let (Some(mmap), Some(madvice)) = (mmap_opt.as_ref(), self.madvice_opt) {
+            // We ignore madvise errors.
+            let _ = mmap.advise(madvice);
+        }
+        Ok(mmap_opt)
+    }
+
     // Returns None if the file exists but as a len of 0 (and hence is not mmappable).
     fn get_mmap(&mut self, full_path: &Path) -> Result<Option<ArcBytes>, OpenReadError> {
         if let Some(mmap_weak) = self.cache.get(full_path) {
@@ -109,7 +138,7 @@ impl MmapCache {
         }
         self.cache.remove(full_path);
         self.counters.miss += 1;
-        let mmap_opt = open_mmap(full_path)?;
+        let mmap_opt = self.open_mmap_impl(full_path)?;
         Ok(mmap_opt.map(|mmap| {
             let mmap_arc: ArcBytes = Arc::new(mmap);
             let mmap_weak = Arc::downgrade(&mmap_arc);
@@ -146,7 +175,7 @@ struct MmapDirectoryInner {
 impl MmapDirectoryInner {
     fn new(root_path: PathBuf, temp_directory: Option<TempDir>) -> MmapDirectoryInner {
         MmapDirectoryInner {
-            mmap_cache: Default::default(),
+            mmap_cache: RwLock::new(MmapCache::new()),
             _temp_directory: temp_directory,
             watcher: FileWatcher::new(&root_path.join(*META_FILEPATH)),
             root_path,
@@ -185,19 +214,51 @@ impl MmapDirectory {
         ))
     }
 
+    /// Opens a MmapDirectory in a directory, with a given access pattern.
+    ///
+    /// This is only supported on unix platforms.
+    #[cfg(unix)]
+    pub fn open_with_madvice(
+        directory_path: impl AsRef<Path>,
+        madvice: Advice,
+    ) -> Result<MmapDirectory, OpenDirectoryError> {
+        let dir = Self::open_impl_to_avoid_monomorphization(directory_path.as_ref())?;
+        dir.inner.mmap_cache.write().unwrap().set_advice(madvice);
+        Ok(dir)
+    }
+
     /// Opens a MmapDirectory in a directory.
     ///
     /// Returns an error if the `directory_path` does not
     /// exist or if it is not a directory.
-    pub fn open<P: AsRef<Path>>(directory_path: P) -> Result<MmapDirectory, OpenDirectoryError> {
-        let directory_path: &Path = directory_path.as_ref();
+    pub fn open(directory_path: impl AsRef<Path>) -> Result<MmapDirectory, OpenDirectoryError> {
+        Self::open_impl_to_avoid_monomorphization(directory_path.as_ref())
+    }
+
+    #[inline(never)]
+    fn open_impl_to_avoid_monomorphization(
+        directory_path: &Path,
+    ) -> Result<MmapDirectory, OpenDirectoryError> {
         if !directory_path.exists() {
             return Err(OpenDirectoryError::DoesNotExist(PathBuf::from(
                 directory_path,
             )));
         }
-        let canonical_path: PathBuf = directory_path.canonicalize().map_err(|io_err| {
-            OpenDirectoryError::wrap_io_error(io_err, PathBuf::from(directory_path))
+        #[allow(clippy::bind_instead_of_map)]
+        let canonical_path: PathBuf = directory_path.canonicalize().or_else(|io_err| {
+            let directory_path = directory_path.to_owned();
+
+            #[cfg(windows)]
+            {
+                // `canonicalize` returns "Incorrect function" (error code 1)
+                // for virtual drives (network drives, ramdisk, etc.).
+                if io_err.raw_os_error() == Some(1) && directory_path.exists() {
+                    // Should call `std::path::absolute` when it is stabilised.
+                    return Ok(directory_path);
+                }
+            }
+
+            Err(OpenDirectoryError::wrap_io_error(io_err, directory_path))
         })?;
         if !canonical_path.is_dir() {
             return Err(OpenDirectoryError::NotADirectory(PathBuf::from(
@@ -313,15 +374,12 @@ pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> io::Result<()> {
 }
 
 impl Directory for MmapDirectory {
-    fn get_file_handle(&self, path: &Path) -> result::Result<Arc<dyn FileHandle>, OpenReadError> {
+    fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
         debug!("Open Read {:?}", path);
         let full_path = self.resolve_path(path);
 
         let mut mmap_cache = self.inner.mmap_cache.write().map_err(|_| {
-            let msg = format!(
-                "Failed to acquired write lock on mmap cache while reading {:?}",
-                path
-            );
+            let msg = format!("Failed to acquired write lock on mmap cache while reading {path:?}");
             let io_err = make_io_err(msg);
             OpenReadError::wrap_io_error(io_err, path.to_path_buf())
         })?;
@@ -339,7 +397,7 @@ impl Directory for MmapDirectory {
 
     /// Any entry associated with the path in the mmap will be
     /// removed before the file is deleted.
-    fn delete(&self, path: &Path) -> result::Result<(), DeleteError> {
+    fn delete(&self, path: &Path) -> Result<(), DeleteError> {
         let full_path = self.resolve_path(path);
         fs::remove_file(full_path).map_err(|e| {
             if e.kind() == io::ErrorKind::NotFound {
@@ -356,7 +414,9 @@ impl Directory for MmapDirectory {
 
     fn exists(&self, path: &Path) -> Result<bool, OpenReadError> {
         let full_path = self.resolve_path(path);
-        Ok(full_path.exists())
+        full_path
+            .try_exists()
+            .map_err(|io_err| OpenReadError::wrap_io_error(io_err, path.to_path_buf()))
     }
 
     fn open_write(&self, path: &Path) -> Result<WritePtr, OpenWriteError> {
@@ -443,25 +503,22 @@ impl Directory for MmapDirectory {
         Ok(self.inner.watch(watch_callback))
     }
 
+    #[cfg(windows)]
+    fn sync_directory(&self) -> Result<(), io::Error> {
+        // On Windows, it is not necessary to fsync the parent directory to
+        // ensure that the directory entry containing the file has also reached
+        // disk, and calling sync_data on a handle to directory is a no-op on
+        // local disks, but will return an error on virtual drives.
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
     fn sync_directory(&self) -> Result<(), io::Error> {
         let mut open_opts = OpenOptions::new();
 
         // Linux needs read to be set, otherwise returns EINVAL
         // write must not be set, or it fails with EISDIR
         open_opts.read(true);
-
-        // On Windows, opening a directory requires FILE_FLAG_BACKUP_SEMANTICS
-        // and calling sync_all() only works if write access is requested.
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-
-            use winapi::um::winbase;
-
-            open_opts
-                .write(true)
-                .custom_flags(winbase::FILE_FLAG_BACKUP_SEMANTICS);
-        }
 
         let fd = open_opts.open(&self.inner.root_path)?;
         fd.sync_data()?;

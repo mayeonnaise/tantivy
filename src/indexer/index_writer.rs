@@ -27,9 +27,9 @@ use crate::{FutureResult, Opstamp};
 // in the `memory_arena` goes below MARGIN_IN_BYTES.
 pub const MARGIN_IN_BYTES: usize = 1_000_000;
 
-// We impose the memory per thread to be at least 3 MB.
-pub const MEMORY_ARENA_NUM_BYTES_MIN: usize = ((MARGIN_IN_BYTES as u32) * 3u32) as usize;
-pub const MEMORY_ARENA_NUM_BYTES_MAX: usize = u32::MAX as usize - MARGIN_IN_BYTES;
+// We impose the memory per thread to be at least 15 MB, as the baseline consumption is 12MB.
+pub const MEMORY_BUDGET_NUM_BYTES_MIN: usize = ((MARGIN_IN_BYTES as u32) * 15u32) as usize;
+pub const MEMORY_BUDGET_NUM_BYTES_MAX: usize = u32::MAX as usize - MARGIN_IN_BYTES;
 
 // We impose the number of index writer threads to be at most this.
 pub const MAX_NUM_THREAD: usize = 8;
@@ -40,8 +40,7 @@ const PIPELINE_MAX_SIZE_IN_DOCS: usize = 10_000;
 
 fn error_in_index_worker_thread(context: &str) -> TantivyError {
     TantivyError::ErrorInThread(format!(
-        "{}. A worker thread encountered an error (io::Error most likely) or panicked.",
-        context
+        "{context}. A worker thread encountered an error (io::Error most likely) or panicked."
     ))
 }
 
@@ -58,7 +57,8 @@ pub struct IndexWriter {
 
     index: Index,
 
-    memory_arena_in_bytes_per_thread: usize,
+    // The memory budget per thread, after which a commit is triggered.
+    memory_budget_in_bytes_per_thread: usize,
 
     workers_join_handle: Vec<JoinHandle<crate::Result<()>>>,
 
@@ -94,10 +94,12 @@ fn compute_deleted_bitset(
         // document that were inserted before it.
         delete_op
             .target
-            .for_each_no_score(segment_reader, &mut |doc_matching_delete_query| {
-                if doc_opstamps.is_deleted(doc_matching_delete_query, delete_op.opstamp) {
-                    alive_bitset.remove(doc_matching_delete_query);
-                    might_have_changed = true;
+            .for_each_no_score(segment_reader, &mut |docs_matching_delete_query| {
+                for doc_matching_delete_query in docs_matching_delete_query.iter().cloned() {
+                    if doc_opstamps.is_deleted(doc_matching_delete_query, delete_op.opstamp) {
+                        alive_bitset.remove(doc_matching_delete_query);
+                        might_have_changed = true;
+                    }
                 }
             })?;
         delete_cursor.advance();
@@ -166,7 +168,7 @@ fn index_documents(
     memory_budget: usize,
     segment: Segment,
     grouped_document_iterator: &mut dyn Iterator<Item = AddBatch>,
-    segment_updater: &mut SegmentUpdater,
+    segment_updater: &SegmentUpdater,
     mut delete_cursor: DeleteCursor,
 ) -> crate::Result<()> {
     let mut segment_writer = SegmentWriter::for_segment(memory_budget, segment.clone())?;
@@ -263,20 +265,19 @@ impl IndexWriter {
     pub(crate) fn new(
         index: &Index,
         num_threads: usize,
-        memory_arena_in_bytes_per_thread: usize,
+        memory_budget_in_bytes_per_thread: usize,
         directory_lock: DirectoryLock,
     ) -> crate::Result<IndexWriter> {
-        if memory_arena_in_bytes_per_thread < MEMORY_ARENA_NUM_BYTES_MIN {
+        if memory_budget_in_bytes_per_thread < MEMORY_BUDGET_NUM_BYTES_MIN {
             let err_msg = format!(
-                "The memory arena in bytes per thread needs to be at least {}.",
-                MEMORY_ARENA_NUM_BYTES_MIN
+                "The memory arena in bytes per thread needs to be at least \
+                 {MEMORY_BUDGET_NUM_BYTES_MIN}."
             );
             return Err(TantivyError::InvalidArgument(err_msg));
         }
-        if memory_arena_in_bytes_per_thread >= MEMORY_ARENA_NUM_BYTES_MAX {
+        if memory_budget_in_bytes_per_thread >= MEMORY_BUDGET_NUM_BYTES_MAX {
             let err_msg = format!(
-                "The memory arena in bytes per thread cannot exceed {}",
-                MEMORY_ARENA_NUM_BYTES_MAX
+                "The memory arena in bytes per thread cannot exceed {MEMORY_BUDGET_NUM_BYTES_MAX}"
             );
             return Err(TantivyError::InvalidArgument(err_msg));
         }
@@ -295,7 +296,7 @@ impl IndexWriter {
         let mut index_writer = IndexWriter {
             _directory_lock: Some(directory_lock),
 
-            memory_arena_in_bytes_per_thread,
+            memory_budget_in_bytes_per_thread,
             index: index.clone(),
             index_writer_status: IndexWriterStatus::from(document_receiver),
             operation_sender: document_sender,
@@ -392,11 +393,11 @@ impl IndexWriter {
         let document_receiver_clone = self.operation_receiver()?;
         let index_writer_bomb = self.index_writer_status.create_bomb();
 
-        let mut segment_updater = self.segment_updater.clone();
+        let segment_updater = self.segment_updater.clone();
 
         let mut delete_cursor = self.delete_queue.cursor();
 
-        let mem_budget = self.memory_arena_in_bytes_per_thread;
+        let mem_budget = self.memory_budget_in_bytes_per_thread;
         let index = self.index.clone();
         let join_handle: JoinHandle<crate::Result<()>> = thread::Builder::new()
             .name(format!("thrd-tantivy-index{}", self.worker_id))
@@ -428,7 +429,7 @@ impl IndexWriter {
                         mem_budget,
                         index.new_segment(),
                         &mut document_iterator,
-                        &mut segment_updater,
+                        &segment_updater,
                         delete_cursor.clone(),
                     )?;
                 }
@@ -554,7 +555,7 @@ impl IndexWriter {
         let new_index_writer: IndexWriter = IndexWriter::new(
             &self.index,
             self.num_threads,
-            self.memory_arena_in_bytes_per_thread,
+            self.memory_budget_in_bytes_per_thread,
             directory_lock,
         )?;
 
@@ -619,7 +620,7 @@ impl IndexWriter {
         for worker_handle in former_workers_join_handle {
             let indexing_worker_result = worker_handle
                 .join()
-                .map_err(|e| TantivyError::ErrorInThread(format!("{:?}", e)))?;
+                .map_err(|e| TantivyError::ErrorInThread(format!("{e:?}")))?;
             indexing_worker_result?;
             self.add_indexing_worker()?;
         }
@@ -801,8 +802,8 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::net::Ipv6Addr;
 
-    use fastfield_codecs::MonotonicallyMappableToU128;
-    use proptest::prelude::*;
+    use columnar::{Cardinality, Column, MonotonicallyMappableToU128};
+    use itertools::Itertools;
     use proptest::prop_oneof;
     use proptest::strategy::Strategy;
 
@@ -810,10 +811,11 @@ mod tests {
     use crate::collector::TopDocs;
     use crate::directory::error::LockError;
     use crate::error::*;
+    use crate::indexer::index_writer::MEMORY_BUDGET_NUM_BYTES_MIN;
     use crate::indexer::NoMergePolicy;
     use crate::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
     use crate::schema::{
-        self, Cardinality, Facet, FacetOptions, IndexRecordOption, IpAddrOptions, NumericOptions,
+        self, Facet, FacetOptions, IndexRecordOption, IpAddrOptions, NumericOptions, Schema,
         TextFieldIndexing, TextOptions, FAST, INDEXED, STORED, STRING, TEXT,
     };
     use crate::store::DOCSTORE_CACHE_CAPACITY;
@@ -833,7 +835,7 @@ mod tests {
     fn test_operations_group() {
         // an operations group with 2 items should cause 3 opstamps 0, 1, and 2.
         let mut schema_builder = schema::Schema::builder();
-        let text_field = schema_builder.add_text_field("text", schema::TEXT);
+        let text_field = schema_builder.add_text_field("text", TEXT);
         let index = Index::create_in_ram(schema_builder.build());
         let index_writer = index.writer_for_tests().unwrap();
         let operations = vec![
@@ -847,7 +849,7 @@ mod tests {
     #[test]
     fn test_no_need_to_rewrite_delete_file_if_no_new_deletes() {
         let mut schema_builder = schema::Schema::builder();
-        let text_field = schema_builder.add_text_field("text", schema::TEXT);
+        let text_field = schema_builder.add_text_field("text", TEXT);
         let index = Index::create_in_ram(schema_builder.build());
 
         let mut index_writer = index.writer_for_tests().unwrap();
@@ -896,7 +898,7 @@ mod tests {
         // * one delete for `doc!(field=>"b")`
         // after commit there is one doc with "a" and 0 doc with "b"
         let mut schema_builder = schema::Schema::builder();
-        let text_field = schema_builder.add_text_field("text", schema::TEXT);
+        let text_field = schema_builder.add_text_field("text", TEXT);
         let index = Index::create_in_ram(schema_builder.build());
         let reader = index
             .reader_builder()
@@ -941,7 +943,7 @@ mod tests {
     fn test_empty_operations_group() {
         let schema_builder = schema::Schema::builder();
         let index = Index::create_in_ram(schema_builder.build());
-        let index_writer = index.writer(3_000_000).unwrap();
+        let index_writer = index.writer_for_tests().unwrap();
         let operations1 = vec![];
         let batch_opstamp1 = index_writer.run(operations1).unwrap();
         assert_eq!(batch_opstamp1, 0u64);
@@ -954,8 +956,8 @@ mod tests {
     fn test_lockfile_stops_duplicates() {
         let schema_builder = schema::Schema::builder();
         let index = Index::create_in_ram(schema_builder.build());
-        let _index_writer = index.writer(3_000_000).unwrap();
-        match index.writer(3_000_000) {
+        let _index_writer = index.writer_for_tests().unwrap();
+        match index.writer_for_tests() {
             Err(TantivyError::LockFailure(LockError::LockBusy, _)) => {}
             _ => panic!("Expected a `LockFailure` error"),
         }
@@ -979,7 +981,7 @@ mod tests {
     fn test_set_merge_policy() {
         let schema_builder = schema::Schema::builder();
         let index = Index::create_in_ram(schema_builder.build());
-        let index_writer = index.writer(3_000_000).unwrap();
+        let index_writer = index.writer_for_tests().unwrap();
         assert_eq!(
             format!("{:?}", index_writer.get_merge_policy()),
             "LogMergePolicy { min_num_segments: 8, max_docs_before_merge: 10000000, \
@@ -998,17 +1000,17 @@ mod tests {
         let schema_builder = schema::Schema::builder();
         let index = Index::create_in_ram(schema_builder.build());
         {
-            let _index_writer = index.writer(3_000_000).unwrap();
+            let _index_writer = index.writer_for_tests().unwrap();
             // the lock should be released when the
             // index_writer leaves the scope.
         }
-        let _index_writer_two = index.writer(3_000_000).unwrap();
+        let _index_writer_two = index.writer_for_tests().unwrap();
     }
 
     #[test]
     fn test_commit_and_rollback() -> crate::Result<()> {
         let mut schema_builder = schema::Schema::builder();
-        let text_field = schema_builder.add_text_field("text", schema::TEXT);
+        let text_field = schema_builder.add_text_field("text", TEXT);
         let index = Index::create_in_ram(schema_builder.build());
         let reader = index
             .reader_builder()
@@ -1022,7 +1024,7 @@ mod tests {
 
         {
             // writing the segment
-            let mut index_writer = index.writer(3_000_000)?;
+            let mut index_writer = index.writer_for_tests()?;
             index_writer.add_document(doc!(text_field=>"a"))?;
             index_writer.rollback()?;
             assert_eq!(index_writer.commit_opstamp(), 0u64);
@@ -1043,7 +1045,7 @@ mod tests {
     #[test]
     fn test_merge_on_empty_segments_single_segment() -> crate::Result<()> {
         let mut schema_builder = schema::Schema::builder();
-        let text_field = schema_builder.add_text_field("text", schema::TEXT);
+        let text_field = schema_builder.add_text_field("text", TEXT);
         let index = Index::create_in_ram(schema_builder.build());
         let reader = index
             .reader_builder()
@@ -1054,7 +1056,7 @@ mod tests {
             reader.searcher().doc_freq(&term_a).unwrap()
         };
         // writing the segment
-        let mut index_writer = index.writer(12_000_000).unwrap();
+        let mut index_writer = index.writer_for_tests().unwrap();
         index_writer.add_document(doc!(text_field=>"a"))?;
         index_writer.commit()?;
         //  this should create 1 segment
@@ -1083,7 +1085,7 @@ mod tests {
     #[test]
     fn test_merge_on_empty_segments() -> crate::Result<()> {
         let mut schema_builder = schema::Schema::builder();
-        let text_field = schema_builder.add_text_field("text", schema::TEXT);
+        let text_field = schema_builder.add_text_field("text", TEXT);
         let index = Index::create_in_ram(schema_builder.build());
         let reader = index
             .reader_builder()
@@ -1094,7 +1096,7 @@ mod tests {
             reader.searcher().doc_freq(&term_a).unwrap()
         };
         // writing the segment
-        let mut index_writer = index.writer(12_000_000).unwrap();
+        let mut index_writer = index.writer_for_tests().unwrap();
         index_writer.add_document(doc!(text_field=>"a"))?;
         index_writer.commit()?;
         index_writer.add_document(doc!(text_field=>"a"))?;
@@ -1129,7 +1131,7 @@ mod tests {
     #[test]
     fn test_with_merges() -> crate::Result<()> {
         let mut schema_builder = schema::Schema::builder();
-        let text_field = schema_builder.add_text_field("text", schema::TEXT);
+        let text_field = schema_builder.add_text_field("text", TEXT);
         let index = Index::create_in_ram(schema_builder.build());
         let reader = index
             .reader_builder()
@@ -1140,7 +1142,7 @@ mod tests {
             reader.searcher().doc_freq(&term_a).unwrap()
         };
         // writing the segment
-        let mut index_writer = index.writer(12_000_000).unwrap();
+        let mut index_writer = index.writer(MEMORY_BUDGET_NUM_BYTES_MIN).unwrap();
         // create 8 segments with 100 tiny docs
         for _doc in 0..100 {
             index_writer.add_document(doc!(text_field=>"a"))?;
@@ -1161,12 +1163,10 @@ mod tests {
     #[test]
     fn test_prepare_with_commit_message() -> crate::Result<()> {
         let mut schema_builder = schema::Schema::builder();
-        let text_field = schema_builder.add_text_field("text", schema::TEXT);
+        let text_field = schema_builder.add_text_field("text", TEXT);
         let index = Index::create_in_ram(schema_builder.build());
 
-        // writing the segment
-        let mut index_writer = index.writer(12_000_000)?;
-        // create 8 segments with 100 tiny docs
+        let mut index_writer = index.writer_for_tests()?;
         for _doc in 0..100 {
             index_writer.add_document(doc!(text_field => "a"))?;
         }
@@ -1193,12 +1193,13 @@ mod tests {
     #[test]
     fn test_prepare_but_rollback() -> crate::Result<()> {
         let mut schema_builder = schema::Schema::builder();
-        let text_field = schema_builder.add_text_field("text", schema::TEXT);
+        let text_field = schema_builder.add_text_field("text", TEXT);
         let index = Index::create_in_ram(schema_builder.build());
 
         {
             // writing the segment
-            let mut index_writer = index.writer_with_num_threads(4, 12_000_000)?;
+            let mut index_writer =
+                index.writer_with_num_threads(4, MEMORY_BUDGET_NUM_BYTES_MIN * 4)?;
             // create 8 segments with 100 tiny docs
             for _doc in 0..100 {
                 index_writer.add_document(doc!(text_field => "a"))?;
@@ -1234,7 +1235,7 @@ mod tests {
     #[test]
     fn test_add_then_delete_all_documents() {
         let mut schema_builder = schema::Schema::builder();
-        let text_field = schema_builder.add_text_field("text", schema::TEXT);
+        let text_field = schema_builder.add_text_field("text", TEXT);
         let index = Index::create_in_ram(schema_builder.build());
         let reader = index
             .reader_builder()
@@ -1247,7 +1248,9 @@ mod tests {
             let term = Term::from_field_text(text_field, s);
             searcher.doc_freq(&term).unwrap()
         };
-        let mut index_writer = index.writer_with_num_threads(4, 12_000_000).unwrap();
+        let mut index_writer = index
+            .writer_with_num_threads(4, MEMORY_BUDGET_NUM_BYTES_MIN * 4)
+            .unwrap();
 
         let add_tstamp = index_writer.add_document(doc!(text_field => "a")).unwrap();
         let commit_tstamp = index_writer.commit().unwrap();
@@ -1262,9 +1265,11 @@ mod tests {
     #[test]
     fn test_delete_all_documents_rollback_correct_stamp() {
         let mut schema_builder = schema::Schema::builder();
-        let text_field = schema_builder.add_text_field("text", schema::TEXT);
+        let text_field = schema_builder.add_text_field("text", TEXT);
         let index = Index::create_in_ram(schema_builder.build());
-        let mut index_writer = index.writer_with_num_threads(4, 12_000_000).unwrap();
+        let mut index_writer = index
+            .writer_with_num_threads(4, MEMORY_BUDGET_NUM_BYTES_MIN * 4)
+            .unwrap();
 
         let add_tstamp = index_writer.add_document(doc!(text_field => "a")).unwrap();
 
@@ -1310,10 +1315,12 @@ mod tests {
     #[test]
     fn test_delete_all_documents_then_add() {
         let mut schema_builder = schema::Schema::builder();
-        let text_field = schema_builder.add_text_field("text", schema::TEXT);
+        let text_field = schema_builder.add_text_field("text", TEXT);
         let index = Index::create_in_ram(schema_builder.build());
         // writing the segment
-        let mut index_writer = index.writer_with_num_threads(4, 12_000_000).unwrap();
+        let mut index_writer = index
+            .writer_with_num_threads(4, MEMORY_BUDGET_NUM_BYTES_MIN * 4)
+            .unwrap();
         let res = index_writer.delete_all_documents();
         assert!(res.is_ok());
 
@@ -1338,9 +1345,11 @@ mod tests {
     #[test]
     fn test_delete_all_documents_and_rollback() {
         let mut schema_builder = schema::Schema::builder();
-        let text_field = schema_builder.add_text_field("text", schema::TEXT);
+        let text_field = schema_builder.add_text_field("text", TEXT);
         let index = Index::create_in_ram(schema_builder.build());
-        let mut index_writer = index.writer_with_num_threads(4, 12_000_000).unwrap();
+        let mut index_writer = index
+            .writer_with_num_threads(4, MEMORY_BUDGET_NUM_BYTES_MIN * 4)
+            .unwrap();
 
         // add one simple doc
         assert!(index_writer.add_document(doc!(text_field => "a")).is_ok());
@@ -1373,7 +1382,9 @@ mod tests {
     fn test_delete_all_documents_empty_index() {
         let schema_builder = schema::Schema::builder();
         let index = Index::create_in_ram(schema_builder.build());
-        let mut index_writer = index.writer_with_num_threads(4, 12_000_000).unwrap();
+        let mut index_writer = index
+            .writer_with_num_threads(4, MEMORY_BUDGET_NUM_BYTES_MIN * 4)
+            .unwrap();
         let clear = index_writer.delete_all_documents();
         let commit = index_writer.commit();
         assert!(clear.is_ok());
@@ -1384,7 +1395,9 @@ mod tests {
     fn test_delete_all_documents_index_twice() {
         let schema_builder = schema::Schema::builder();
         let index = Index::create_in_ram(schema_builder.build());
-        let mut index_writer = index.writer_with_num_threads(4, 12_000_000).unwrap();
+        let mut index_writer = index
+            .writer_with_num_threads(4, MEMORY_BUDGET_NUM_BYTES_MIN * 4)
+            .unwrap();
         let clear = index_writer.delete_all_documents();
         let commit = index_writer.commit();
         assert!(clear.is_ok());
@@ -1396,39 +1409,62 @@ mod tests {
     }
 
     #[test]
-    fn test_sort_by_multivalue_field_error() -> crate::Result<()> {
+    fn test_delete_and_merge_removes_terms_fast_field_dict() {
         let mut schema_builder = schema::Schema::builder();
-        let options = NumericOptions::default().set_fast(Cardinality::MultiValues);
-        schema_builder.add_u64_field("id", options);
+        let text_field = schema_builder.add_text_field("text", STRING | FAST);
         let schema = schema_builder.build();
 
-        let settings = IndexSettings {
-            sort_by_field: Some(IndexSortByField {
-                field: "id".to_string(),
-                order: Order::Desc,
-            }),
-            ..Default::default()
-        };
+        let index = Index::builder().schema(schema).create_in_ram().unwrap();
+        let mut index_writer = index.writer_for_tests().unwrap();
+        index_writer
+            .add_document(doc!(text_field => "one"))
+            .unwrap();
+        index_writer
+            .add_document(doc!(text_field => "two"))
+            .unwrap();
+        index_writer
+            .add_document(doc!(text_field => "three"))
+            .unwrap();
+        index_writer.commit().unwrap();
+        let index_reader = index.reader().unwrap();
+        let searcher = index_reader.searcher();
+        let segment_reader = searcher.segment_reader(0);
+        let text_fast_field = segment_reader.fast_fields().str("text").unwrap().unwrap();
+        let mut buffer = String::new();
+        assert!(text_fast_field.ord_to_str(0, &mut buffer).unwrap());
+        assert_eq!(buffer, "one");
+        assert!(text_fast_field.ord_to_str(1, &mut buffer).unwrap());
+        assert_eq!(buffer, "three");
+        assert!(text_fast_field.ord_to_str(2, &mut buffer).unwrap());
+        assert_eq!(buffer, "two");
+        assert!(!text_fast_field.ord_to_str(3, &mut buffer).unwrap());
 
-        let err = Index::builder()
-            .schema(schema)
-            .settings(settings)
-            .create_in_ram()
-            .unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "An invalid argument was passed: 'Only single value fast field Cardinality supported \
-             for sorting index id'"
-        );
-
-        Ok(())
+        assert_eq!(segment_reader.max_doc(), 3);
+        index_writer.delete_term(Term::from_field_text(text_field, "three"));
+        index_writer.commit().unwrap();
+        index_writer
+            .merge(&[segment_reader.segment_id()])
+            .wait()
+            .unwrap();
+        index_reader.reload().unwrap();
+        let searcher = index_reader.searcher();
+        let segment_reader = searcher.segment_reader(0);
+        assert_eq!(segment_reader.max_doc(), 2);
+        let text_fast_field = segment_reader.fast_fields().str("text").unwrap().unwrap();
+        let mut buffer = String::new();
+        assert!(text_fast_field.ord_to_str(0, &mut buffer).unwrap());
+        assert_eq!(buffer, "one");
+        assert!(text_fast_field.ord_to_str(1, &mut buffer).unwrap());
+        assert_eq!(buffer, "two");
+        assert!(!text_fast_field.ord_to_str(2, &mut buffer).unwrap());
+        assert!(text_fast_field.term_ords(0).eq([0].into_iter()));
+        assert!(text_fast_field.term_ords(1).eq([1].into_iter()));
     }
 
     #[test]
     fn test_delete_with_sort_by_field() -> crate::Result<()> {
         let mut schema_builder = schema::Schema::builder();
-        let id_field =
-            schema_builder.add_u64_field("id", schema::INDEXED | schema::STORED | schema::FAST);
+        let id_field = schema_builder.add_u64_field("id", INDEXED | schema::STORED | FAST);
         let schema = schema_builder.build();
 
         let settings = IndexSettings {
@@ -1466,9 +1502,10 @@ mod tests {
         assert_eq!(segment_reader.num_docs(), 8);
         assert_eq!(segment_reader.max_doc(), 10);
         let fast_field_reader = segment_reader.fast_fields().u64("id")?;
+
         let in_order_alive_ids: Vec<u64> = segment_reader
             .doc_ids_alive()
-            .map(|doc| fast_field_reader.get_val(doc))
+            .flat_map(|doc| fast_field_reader.values_for_doc(doc))
             .collect();
         assert_eq!(&in_order_alive_ids[..], &[9, 8, 7, 6, 5, 4, 1, 0]);
         Ok(())
@@ -1477,8 +1514,7 @@ mod tests {
     #[test]
     fn test_delete_query_with_sort_by_field() -> crate::Result<()> {
         let mut schema_builder = schema::Schema::builder();
-        let id_field =
-            schema_builder.add_u64_field("id", schema::INDEXED | schema::STORED | schema::FAST);
+        let id_field = schema_builder.add_u64_field("id", INDEXED | schema::STORED | FAST);
         let schema = schema_builder.build();
 
         let settings = IndexSettings {
@@ -1529,7 +1565,7 @@ mod tests {
         let fast_field_reader = segment_reader.fast_fields().u64("id")?;
         let in_order_alive_ids: Vec<u64> = segment_reader
             .doc_ids_alive()
-            .map(|doc| fast_field_reader.get_val(doc))
+            .flat_map(|doc| fast_field_reader.values_for_doc(doc))
             .collect();
         assert_eq!(&in_order_alive_ids[..], &[9, 8, 7, 6, 5, 4, 2, 0]);
         Ok(())
@@ -1610,17 +1646,14 @@ mod tests {
         ops: &[IndexingOp],
         sort_index: bool,
         force_end_merge: bool,
-    ) -> crate::Result<()> {
+    ) -> crate::Result<Index> {
         let mut schema_builder = schema::Schema::builder();
         let ip_field = schema_builder.add_ip_addr_field("ip", FAST | INDEXED | STORED);
-        let ips_field = schema_builder.add_ip_addr_field(
-            "ips",
-            IpAddrOptions::default()
-                .set_fast(Cardinality::MultiValues)
-                .set_indexed(),
-        );
-        let id_field = schema_builder.add_u64_field("id", FAST | INDEXED | STORED);
+        let ips_field = schema_builder
+            .add_ip_addr_field("ips", IpAddrOptions::default().set_fast().set_indexed());
         let i64_field = schema_builder.add_i64_field("i64", INDEXED);
+        let id_field = schema_builder.add_u64_field("id", FAST | INDEXED | STORED);
+        let id_opt_field = schema_builder.add_u64_field("id_opt", FAST | INDEXED | STORED);
         let f64_field = schema_builder.add_f64_field("f64", INDEXED);
         let date_field = schema_builder.add_date_field("date", INDEXED);
         let bytes_field = schema_builder.add_bytes_field("bytes", FAST | INDEXED | STORED);
@@ -1640,22 +1673,18 @@ mod tests {
 
         let multi_numbers = schema_builder.add_u64_field(
             "multi_numbers",
-            NumericOptions::default()
-                .set_fast(Cardinality::MultiValues)
-                .set_stored(),
+            NumericOptions::default().set_fast().set_stored(),
         );
         let multi_bools = schema_builder.add_bool_field(
             "multi_bools",
-            NumericOptions::default()
-                .set_fast(Cardinality::MultiValues)
-                .set_stored(),
+            NumericOptions::default().set_fast().set_stored(),
         );
         let facet_field = schema_builder.add_facet_field("facet", FacetOptions::default());
         let schema = schema_builder.build();
         let settings = if sort_index {
             IndexSettings {
                 sort_by_field: Some(IndexSortByField {
-                    field: "id".to_string(),
+                    field: "id_opt".to_string(),
                     order: Order::Asc,
                 }),
                 ..Default::default()
@@ -1674,7 +1703,7 @@ mod tests {
 
         let old_reader = index.reader()?;
 
-        let ip_exists = |id| id % 3 != 0; // 0 does not exist
+        let id_exists = |id| id % 3 != 0; // 0 does not exist
 
         let multi_text_field_text1 = "test1 test2 test3 test1 test2 test3";
         // rotate left
@@ -1690,28 +1719,15 @@ mod tests {
                     let facet = Facet::from(&("/cola/".to_string() + &id.to_string()));
                     let ip = ip_from_id(id);
 
-                    if !ip_exists(id) {
+                    if !id_exists(id) {
                         // every 3rd doc has no ip field
-                        index_writer.add_document(doc!(id_field=>id,
-                                bytes_field => id.to_le_bytes().as_slice(),
-                                multi_numbers=> id,
-                                multi_numbers => id,
-                                bool_field => (id % 2u64) != 0,
-                                i64_field => id as i64,
-                                f64_field => id as f64,
-                                date_field => DateTime::from_timestamp_secs(id as i64),
-                                multi_bools => (id % 2u64) != 0,
-                                multi_bools => (id % 2u64) == 0,
-                                text_field => id.to_string(),
-                                facet_field => facet,
-                                large_text_field => LOREM,
-                                multi_text_fields => multi_text_field_text1,
-                                multi_text_fields => multi_text_field_text2,
-                                multi_text_fields => multi_text_field_text3,
+                        index_writer.add_document(doc!(
+                            id_field=>id,
                         ))?;
                     } else {
                         index_writer.add_document(doc!(id_field=>id,
                                 bytes_field => id.to_le_bytes().as_slice(),
+                                id_opt_field => id,
                                 ip_field => ip,
                                 ips_field => ip,
                                 ips_field => ip,
@@ -1744,9 +1760,10 @@ mod tests {
                     index_writer.commit()?;
                 }
                 IndexingOp::Merge => {
-                    let segment_ids = index
+                    let mut segment_ids = index
                         .searchable_segment_ids()
                         .expect("Searchable segments failed.");
+                    segment_ids.sort();
                     if segment_ids.len() >= 2 {
                         index_writer.merge(&segment_ids).wait().unwrap();
                         assert!(index_writer.segment_updater().wait_merging_thread().is_ok());
@@ -1781,7 +1798,7 @@ mod tests {
                 let ff_reader = segment_reader.fast_fields().u64("id").unwrap();
                 segment_reader
                     .doc_ids_alive()
-                    .map(move |doc| ff_reader.get_val(doc))
+                    .flat_map(move |doc| ff_reader.values_for_doc(doc).collect_vec().into_iter())
             })
             .collect();
 
@@ -1792,7 +1809,7 @@ mod tests {
                 let ff_reader = segment_reader.fast_fields().u64("id").unwrap();
                 segment_reader
                     .doc_ids_alive()
-                    .map(move |doc| ff_reader.get_val(doc))
+                    .flat_map(move |doc| ff_reader.values_for_doc(doc).collect_vec().into_iter())
             })
             .collect();
 
@@ -1804,19 +1821,28 @@ mod tests {
         let mut all_ips = Vec::new();
         let mut num_ips = 0;
         for segment_reader in searcher.segment_readers().iter() {
-            let ip_reader = segment_reader.fast_fields().ip_addrs("ips").unwrap();
+            let ip_reader: Column<Ipv6Addr> = segment_reader
+                .fast_fields()
+                .column_opt("ips")
+                .unwrap()
+                .unwrap();
             for doc in segment_reader.doc_ids_alive() {
-                let mut vals = vec![];
-                ip_reader.get_vals(doc, &mut vals);
-                all_ips.extend_from_slice(&vals);
+                all_ips.extend(ip_reader.values_for_doc(doc));
             }
-            num_ips += ip_reader.total_num_vals();
+            num_ips += ip_reader.values.num_vals();
         }
 
         let num_docs_expected = expected_ids_and_num_occurrences
             .values()
             .map(|id_occurrences| *id_occurrences as usize)
             .sum::<usize>();
+
+        let num_docs_with_values = expected_ids_and_num_occurrences
+            .iter()
+            .filter(|(id, _id_occurrences)| id_exists(**id))
+            .map(|(_, id_occurrences)| *id_occurrences as usize)
+            .sum::<usize>();
+
         assert_eq!(searcher.num_docs() as usize, num_docs_expected);
         assert_eq!(old_searcher.num_docs() as usize, num_docs_expected);
         assert_eq!(
@@ -1837,7 +1863,7 @@ mod tests {
         if force_end_merge && num_segments_before_merge > 1 && num_segments_after_merge == 1 {
             let mut expected_multi_ips: Vec<_> = id_list
                 .iter()
-                .filter(|id| ip_exists(**id))
+                .filter(|id| id_exists(**id))
                 .flat_map(|id| vec![ip_from_id(*id), ip_from_id(*id)])
                 .collect();
             assert_eq!(num_ips, expected_multi_ips.len() as u32);
@@ -1851,35 +1877,31 @@ mod tests {
                 .segment_readers()
                 .iter()
                 .map(|segment_reader| {
-                    let ff_reader = segment_reader.fast_fields().ip_addrs("ips").unwrap();
-                    ff_reader.get_index_reader().num_docs() as usize
+                    let ff_reader = segment_reader
+                        .fast_fields()
+                        .column_opt::<Ipv6Addr>("ips")
+                        .unwrap()
+                        .unwrap();
+                    ff_reader.num_docs() as usize
                 })
                 .sum();
             assert_eq!(num_docs, num_docs_expected);
         }
 
         // Load all ips addr
-        let ips: HashSet<Ipv6Addr> = searcher
-            .segment_readers()
-            .iter()
-            .flat_map(|segment_reader| {
-                let ff_reader = segment_reader.fast_fields().ip_addr("ip").unwrap();
-                segment_reader.doc_ids_alive().flat_map(move |doc| {
-                    let val = ff_reader.get_val(doc);
-                    if val == Ipv6Addr::from_u128(0) {
-                        // TODO Fix null handling
-                        None
-                    } else {
-                        Some(val)
-                    }
-                })
-            })
-            .collect();
+        let mut ips: HashSet<Ipv6Addr> = Default::default();
+        for reader in searcher.segment_readers() {
+            if let Some(ff_reader) = reader.fast_fields().column_opt::<Ipv6Addr>("ips").unwrap() {
+                for doc in reader.doc_ids_alive() {
+                    ips.extend(ff_reader.values_for_doc(doc));
+                }
+            }
+        }
 
         let expected_ips = expected_ids_and_num_occurrences
             .keys()
             .flat_map(|id| {
-                if !ip_exists(*id) {
+                if !id_exists(*id) {
                     None
                 } else {
                     Some(Ipv6Addr::from_u128(*id as u128))
@@ -1891,45 +1913,57 @@ mod tests {
         let expected_ips = expected_ids_and_num_occurrences
             .keys()
             .filter_map(|id| {
-                if !ip_exists(*id) {
+                if !id_exists(*id) {
                     None
                 } else {
                     Some(Ipv6Addr::from_u128(*id as u128))
                 }
             })
             .collect::<HashSet<_>>();
-        let ips: HashSet<Ipv6Addr> = searcher
-            .segment_readers()
-            .iter()
-            .flat_map(|segment_reader| {
-                let ff_reader = segment_reader.fast_fields().ip_addrs("ips").unwrap();
-                segment_reader.doc_ids_alive().flat_map(move |doc| {
-                    let mut vals = vec![];
-                    ff_reader.get_vals(doc, &mut vals);
-                    vals.into_iter().filter(|val| val.to_u128() != 0) // TODO Fix null handling
-                })
-            })
-            .collect();
+
+        let mut ips: HashSet<Ipv6Addr> = Default::default();
+        for reader in searcher.segment_readers() {
+            if let Some(ff_reader) = reader.fast_fields().column_opt::<Ipv6Addr>("ips").unwrap() {
+                for doc in reader.doc_ids_alive() {
+                    ips.extend(ff_reader.values_for_doc(doc));
+                }
+            }
+        }
         assert_eq!(ips, expected_ips);
 
         // multivalue fast field tests
         for segment_reader in searcher.segment_readers().iter() {
             let id_reader = segment_reader.fast_fields().u64("id").unwrap();
-            let ff_reader = segment_reader.fast_fields().u64s("multi_numbers").unwrap();
-            let bool_ff_reader = segment_reader.fast_fields().bools("multi_bools").unwrap();
+            let ff_reader = segment_reader
+                .fast_fields()
+                .column_opt("multi_numbers")
+                .unwrap()
+                .unwrap();
+            let bool_ff_reader = segment_reader
+                .fast_fields()
+                .column_opt::<bool>("multi_bools")
+                .unwrap()
+                .unwrap();
             for doc in segment_reader.doc_ids_alive() {
-                let mut vals = vec![];
-                ff_reader.get_vals(doc, &mut vals);
-                assert_eq!(vals.len(), 2);
-                assert_eq!(vals[0], vals[1]);
-                assert_eq!(id_reader.get_val(doc), vals[0]);
+                let id = id_reader.first(doc).unwrap();
 
-                let mut bool_vals = vec![];
-                bool_ff_reader.get_vals(doc, &mut bool_vals);
-                assert_eq!(bool_vals.len(), 2);
-                assert_ne!(bool_vals[0], bool_vals[1]);
+                let vals: Vec<u64> = ff_reader.values_for_doc(doc).collect();
+                if id_exists(id) {
+                    assert_eq!(vals.len(), 2);
+                    assert_eq!(vals[0], vals[1]);
+                    assert!(expected_ids_and_num_occurrences.contains_key(&vals[0]));
+                    assert_eq!(id_reader.first(doc), Some(vals[0]));
+                } else {
+                    assert_eq!(vals.len(), 0);
+                }
 
-                assert!(expected_ids_and_num_occurrences.contains_key(&vals[0]));
+                let bool_vals: Vec<bool> = bool_ff_reader.values_for_doc(doc).collect();
+                if id_exists(id) {
+                    assert_eq!(bool_vals.len(), 2);
+                    assert_ne!(bool_vals[0], bool_vals[1]);
+                } else {
+                    assert_eq!(bool_vals.len(), 0);
+                }
             }
         }
 
@@ -1953,26 +1987,28 @@ mod tests {
                     .as_u64()
                     .unwrap();
                 assert!(expected_ids_and_num_occurrences.contains_key(&id));
-                let id2 = store_reader
-                    .get(doc_id)
-                    .unwrap()
-                    .get_first(multi_numbers)
-                    .unwrap()
-                    .as_u64()
-                    .unwrap();
-                assert_eq!(id, id2);
-                let bool = store_reader
-                    .get(doc_id)
-                    .unwrap()
-                    .get_first(bool_field)
-                    .unwrap()
-                    .as_bool()
-                    .unwrap();
-                let doc = store_reader.get(doc_id).unwrap();
-                let mut bool2 = doc.get_all(multi_bools);
-                assert_eq!(bool, bool2.next().unwrap().as_bool().unwrap());
-                assert_ne!(bool, bool2.next().unwrap().as_bool().unwrap());
-                assert_eq!(None, bool2.next())
+                if id_exists(id) {
+                    let id2 = store_reader
+                        .get(doc_id)
+                        .unwrap()
+                        .get_first(multi_numbers)
+                        .unwrap()
+                        .as_u64()
+                        .unwrap();
+                    assert_eq!(id, id2);
+                    let bool = store_reader
+                        .get(doc_id)
+                        .unwrap()
+                        .get_first(bool_field)
+                        .unwrap()
+                        .as_bool()
+                        .unwrap();
+                    let doc = store_reader.get(doc_id).unwrap();
+                    let mut bool2 = doc.get_all(multi_bools);
+                    assert_eq!(bool, bool2.next().unwrap().as_bool().unwrap());
+                    assert_ne!(bool, bool2.next().unwrap().as_bool().unwrap());
+                    assert_eq!(None, bool2.next())
+                }
             }
         }
         // test search
@@ -1994,22 +2030,25 @@ mod tests {
             top_docs.iter().map(|el| el.1).collect::<Vec<_>>()
         };
 
-        for (existing_id, count) in &expected_ids_and_num_occurrences {
-            let (existing_id, count) = (*existing_id, *count);
+        for (id, count) in &expected_ids_and_num_occurrences {
+            let (existing_id, count) = (*id, *count);
             let get_num_hits = |field| do_search(&existing_id.to_string(), field).len() as u64;
+            assert_eq!(get_num_hits(id_field), count);
+            if !id_exists(existing_id) {
+                continue;
+            }
             assert_eq!(get_num_hits(text_field), count);
             assert_eq!(get_num_hits(i64_field), count);
             assert_eq!(get_num_hits(f64_field), count);
-            assert_eq!(get_num_hits(id_field), count);
 
             // Test multi text
             assert_eq!(
                 do_search("\"test1 test2\"", multi_text_fields).len(),
-                num_docs_expected
+                num_docs_with_values
             );
             assert_eq!(
                 do_search("\"test2 test3\"", multi_text_fields).len(),
-                num_docs_expected
+                num_docs_with_values
             );
 
             // Test bytes
@@ -2045,20 +2084,20 @@ mod tests {
         //
         for (existing_id, count) in &expected_ids_and_num_occurrences {
             let (existing_id, count) = (*existing_id, *count);
-            if !ip_exists(existing_id) {
+            if !id_exists(existing_id) {
                 continue;
             }
             let do_search_ip_field = |term: &str| do_search(term, ip_field).len() as u64;
             let ip_addr = Ipv6Addr::from_u128(existing_id as u128);
             // Test incoming ip as ipv6
-            assert_eq!(do_search_ip_field(&format!("\"{}\"", ip_addr)), count);
+            assert_eq!(do_search_ip_field(&format!("\"{ip_addr}\"")), count);
 
             let term = Term::from_field_ip_addr(ip_field, ip_addr);
             assert_eq!(do_search2(term).len() as u64, count);
 
             // Test incoming ip as ipv4
             if let Some(ip_addr) = ip_addr.to_ipv4_mapped() {
-                assert_eq!(do_search_ip_field(&format!("\"{}\"", ip_addr)), count);
+                assert_eq!(do_search_ip_field(&format!("\"{ip_addr}\"")), count);
             }
         }
 
@@ -2066,7 +2105,7 @@ mod tests {
         //
         for (existing_id, count) in expected_ids_and_num_occurrences.iter().take(10) {
             let (existing_id, count) = (*existing_id, *count);
-            if !ip_exists(existing_id) {
+            if !id_exists(existing_id) {
                 continue;
             }
             let gen_query_inclusive = |field: &str, from: Ipv6Addr, to: Ipv6Addr| {
@@ -2076,11 +2115,12 @@ mod tests {
 
             let do_search_ip_field = |term: &str| do_search(term, ip_field).len() as u64;
             // Range query on single value field
-            // let query = gen_query_inclusive("ip", ip, ip);
-            // assert_eq!(do_search_ip_field(&query), count);
+            let query = gen_query_inclusive("ip", ip, ip);
+            assert_eq!(do_search_ip_field(&query), count);
 
             // Range query on multi value field
             let query = gen_query_inclusive("ips", ip, ip);
+
             assert_eq!(do_search_ip_field(&query), count);
         }
 
@@ -2088,7 +2128,7 @@ mod tests {
         //
         for (existing_id, count) in expected_ids_and_num_occurrences.iter().take(10) {
             let (existing_id, count) = (*existing_id, *count);
-            if !ip_exists(existing_id) {
+            if !id_exists(existing_id) {
                 continue;
             }
             let gen_query_inclusive = |field: &str, from: Ipv6Addr, to: Ipv6Addr| {
@@ -2098,8 +2138,8 @@ mod tests {
 
             let do_search_ip_field = |term: &str| do_search(term, ip_field).len() as u64;
             // Range query on single value field
-            // let query = gen_query_inclusive("ip", ip, ip);
-            // assert_eq!(do_search_ip_field(&query), count);
+            let query = gen_query_inclusive("ip", ip, ip);
+            assert_eq!(do_search_ip_field(&query), count);
 
             // Range query on multi value field
             let query = gen_query_inclusive("ips", ip, ip);
@@ -2108,23 +2148,64 @@ mod tests {
 
         // test facets
         for segment_reader in searcher.segment_readers().iter() {
-            let mut facet_reader = segment_reader.facet_reader(facet_field).unwrap();
-            let ff_reader = segment_reader.fast_fields().u64("id").unwrap();
+            let facet_reader = segment_reader.facet_reader("facet").unwrap();
+            let ff_reader = segment_reader
+                .fast_fields()
+                .u64("id")
+                .unwrap()
+                .first_or_default_col(9999);
             for doc_id in segment_reader.doc_ids_alive() {
-                let mut facet_ords = Vec::new();
-                facet_reader.facet_ords(doc_id, &mut facet_ords);
+                let id = ff_reader.get_val(doc_id);
+                if !id_exists(id) {
+                    continue;
+                }
+                let facet_ords: Vec<u64> = facet_reader.facet_ords(doc_id).collect();
                 assert_eq!(facet_ords.len(), 1);
                 let mut facet = Facet::default();
                 facet_reader
                     .facet_from_ord(facet_ords[0], &mut facet)
                     .unwrap();
-                let id = ff_reader.get_val(doc_id);
                 let facet_expected = Facet::from(&("/cola/".to_string() + &id.to_string()));
 
                 assert_eq!(facet, facet_expected);
             }
         }
-        Ok(())
+
+        // Test if index property is in sort order
+        if sort_index {
+            // load all id_opt in each segment and check they are in order
+
+            for reader in searcher.segment_readers() {
+                let (ff_reader, _) = reader.fast_fields().u64_lenient("id_opt").unwrap().unwrap();
+                let mut ids_in_segment: Vec<u64> = Vec::new();
+
+                for doc in 0..reader.num_docs() {
+                    ids_in_segment.extend(ff_reader.values_for_doc(doc));
+                }
+
+                assert!(is_sorted(&ids_in_segment));
+
+                fn is_sorted<T>(data: &[T]) -> bool
+                where T: Ord {
+                    data.windows(2).all(|w| w[0] <= w[1])
+                }
+            }
+        }
+        Ok(index)
+    }
+
+    #[test]
+    fn test_sort_index_on_opt_field_regression() {
+        assert!(test_operation_strategy(
+            &[
+                IndexingOp::AddDoc { id: 81 },
+                IndexingOp::AddDoc { id: 70 },
+                IndexingOp::DeleteDoc { id: 70 }
+            ],
+            true,
+            false
+        )
+        .is_ok());
     }
 
     #[test]
@@ -2162,7 +2243,67 @@ mod tests {
     }
 
     #[test]
-    fn test_minimal() {
+    fn test_minimal_sort_force_end_merge() {
+        assert!(test_operation_strategy(
+            &[IndexingOp::AddDoc { id: 23 }, IndexingOp::AddDoc { id: 13 },],
+            false,
+            false
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_minimal_sort() {
+        let mut schema_builder = Schema::builder();
+        let val = schema_builder.add_u64_field("val", FAST);
+        let id = schema_builder.add_u64_field("id", FAST);
+        let schema = schema_builder.build();
+        let settings = IndexSettings {
+            sort_by_field: Some(IndexSortByField {
+                field: "id".to_string(),
+                order: Order::Asc,
+            }),
+            ..Default::default()
+        };
+        let index = Index::builder()
+            .schema(schema)
+            .settings(settings)
+            .create_in_ram()
+            .unwrap();
+        let mut writer = index.writer_for_tests().unwrap();
+        writer
+            .add_document(doc!(id=> 3u64, val=>4u64, val=>4u64))
+            .unwrap();
+        writer
+            .add_document(doc!(id=> 2u64, val=>2u64, val=>2u64))
+            .unwrap();
+        writer
+            .add_document(doc!(id=> 1u64, val=>1u64, val=>1u64))
+            .unwrap();
+        writer.commit().unwrap();
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        let segment_reader = searcher.segment_reader(0);
+        let id_col: Column = segment_reader
+            .fast_fields()
+            .column_opt("id")
+            .unwrap()
+            .unwrap();
+        let val_col: Column = segment_reader
+            .fast_fields()
+            .column_opt("val")
+            .unwrap()
+            .unwrap();
+        assert_eq!(id_col.get_cardinality(), Cardinality::Full);
+        assert_eq!(val_col.get_cardinality(), Cardinality::Multivalued);
+        assert_eq!(id_col.first(0u32), Some(1u64));
+        assert_eq!(id_col.first(1u32), Some(2u64));
+        assert!(val_col.values_for_doc(0u32).eq([1u64, 1u64].into_iter()));
+        assert!(val_col.values_for_doc(1u32).eq([2u64, 2u64].into_iter()));
+    }
+
+    #[test]
+    fn test_minimal_sort_force_end_merge_with_delete() {
         assert!(test_operation_strategy(
             &[
                 IndexingOp::AddDoc { id: 23 },
@@ -2173,7 +2314,10 @@ mod tests {
             true
         )
         .is_ok());
+    }
 
+    #[test]
+    fn test_minimal_no_sort_no_force_end_merge() {
         assert!(test_operation_strategy(
             &[
                 IndexingOp::AddDoc { id: 23 },
@@ -2191,43 +2335,51 @@ mod tests {
         assert!(test_operation_strategy(&[IndexingOp::AddDoc { id: 3 },], true, true).is_ok());
     }
 
+    use proptest::prelude::*;
+
     proptest! {
+
         #![proptest_config(ProptestConfig::with_cases(20))]
         #[test]
         fn test_delete_with_sort_proptest_adding(ops in proptest::collection::vec(adding_operation_strategy(), 1..100)) {
             assert!(test_operation_strategy(&ops[..], true, false).is_ok());
         }
+
         #[test]
         fn test_delete_without_sort_proptest_adding(ops in proptest::collection::vec(adding_operation_strategy(), 1..100)) {
             assert!(test_operation_strategy(&ops[..], false, false).is_ok());
         }
+
         #[test]
         fn test_delete_with_sort_proptest_with_merge_adding(ops in proptest::collection::vec(adding_operation_strategy(), 1..100)) {
             assert!(test_operation_strategy(&ops[..], true, true).is_ok());
         }
+
         #[test]
         fn test_delete_without_sort_proptest_with_merge_adding(ops in proptest::collection::vec(adding_operation_strategy(), 1..100)) {
-            assert!(test_operation_strategy(&ops[..], false, true).is_ok());
-        }
+            assert!(test_operation_strategy(&ops[..], false, true).is_ok());}
 
         #[test]
         fn test_delete_with_sort_proptest(ops in proptest::collection::vec(balanced_operation_strategy(), 1..10)) {
             assert!(test_operation_strategy(&ops[..], true, false).is_ok());
         }
+
         #[test]
         fn test_delete_without_sort_proptest(ops in proptest::collection::vec(balanced_operation_strategy(), 1..10)) {
             assert!(test_operation_strategy(&ops[..], false, false).is_ok());
         }
+
         #[test]
         fn test_delete_with_sort_proptest_with_merge(ops in proptest::collection::vec(balanced_operation_strategy(), 1..10)) {
             assert!(test_operation_strategy(&ops[..], true, true).is_ok());
         }
+
+
+
         #[test]
         fn test_delete_without_sort_proptest_with_merge(ops in proptest::collection::vec(balanced_operation_strategy(), 1..100)) {
             assert!(test_operation_strategy(&ops[..], false, true).is_ok());
         }
-
-
     }
 
     #[test]
@@ -2270,6 +2422,54 @@ mod tests {
         assert_eq!(segment_reader.max_doc(), 2);
         assert_eq!(segment_reader.num_docs(), 1);
         Ok(())
+    }
+
+    #[test]
+    fn test_delete_bug_reproduction_ip_addr() {
+        use IndexingOp::*;
+        let ops = &[
+            AddDoc { id: 1 },
+            AddDoc { id: 2 },
+            Commit,
+            AddDoc { id: 3 },
+            DeleteDoc { id: 1 },
+            Commit,
+            Merge,
+            AddDoc { id: 4 },
+            Commit,
+        ];
+        test_operation_strategy(&ops[..], false, true).unwrap();
+    }
+
+    #[test]
+    fn test_merge_regression_1() {
+        use IndexingOp::*;
+        let ops = &[AddDoc { id: 15 }, Commit, AddDoc { id: 9 }, Commit, Merge];
+        test_operation_strategy(&ops[..], false, true).unwrap();
+    }
+
+    #[test]
+    fn test_range_query_bug_1() {
+        use IndexingOp::*;
+        let ops = &[
+            AddDoc { id: 9 },
+            AddDoc { id: 0 },
+            AddDoc { id: 13 },
+            Commit,
+        ];
+        test_operation_strategy(&ops[..], false, true).unwrap();
+    }
+
+    #[test]
+    fn test_range_query_bug_2() {
+        use IndexingOp::*;
+        let ops = &[
+            AddDoc { id: 3 },
+            AddDoc { id: 6 },
+            AddDoc { id: 9 },
+            AddDoc { id: 10 },
+        ];
+        test_operation_strategy(&ops[..], false, false).unwrap();
     }
 
     #[test]
@@ -2359,7 +2559,7 @@ mod tests {
         let top_docs: Vec<(f32, DocAddress)> =
             searcher.search(&query, &TopDocs::with_limit(10)).unwrap();
 
-        assert_eq!(top_docs.len(), 1); // Fails
+        assert_eq!(top_docs.len(), 1); // Was failing
 
         Ok(())
     }

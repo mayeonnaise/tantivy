@@ -50,12 +50,13 @@ fn main() -> tantivy::Result<()> {
 
     // This tokenizer lowers all of the text (to help with stop word matching)
     // then removes all instances of `the` and `and` from the corpus
-    let tokenizer = TextAnalyzer::from(SimpleTokenizer)
+    let tokenizer = TextAnalyzer::builder(SimpleTokenizer::default())
         .filter(LowerCaser)
         .filter(StopWordFilter::remove(vec![
             "the".to_string(),
             "and".to_string(),
-        ]));
+        ]))
+        .build();
 
     index.tokenizers().register("stoppy", tokenizer);
 
@@ -105,7 +106,7 @@ fn main() -> tantivy::Result<()> {
 
     for (score, doc_address) in top_docs {
         let retrieved_doc = searcher.doc(doc_address)?;
-        println!("\n==\nDocument score {}:", score);
+        println!("\n==\nDocument score {score}:");
         println!("{}", schema.to_json(&retrieved_doc));
     }
 

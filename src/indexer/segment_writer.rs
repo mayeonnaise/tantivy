@@ -1,21 +1,22 @@
-use fastfield_codecs::MonotonicallyMappableToU64;
+use columnar::MonotonicallyMappableToU64;
 use itertools::Itertools;
+use tokenizer_api::BoxTokenStream;
 
 use super::doc_id_mapping::{get_doc_id_mapping_from_field, DocIdMapping};
 use super::operation::AddOperation;
+use crate::core::json_utils::index_json_values;
 use crate::core::Segment;
 use crate::fastfield::FastFieldsWriter;
 use crate::fieldnorm::{FieldNormReaders, FieldNormsWriter};
-use crate::indexer::json_term_writer::index_json_values;
 use crate::indexer::segment_serializer::SegmentSerializer;
 use crate::postings::{
-    compute_table_size, serialize_postings, IndexingContext, IndexingPosition,
+    compute_table_memory_size, serialize_postings, IndexingContext, IndexingPosition,
     PerFieldPostingsWriter, PostingsWriter,
 };
-use crate::schema::{FieldEntry, FieldType, Schema, Term, Value};
+use crate::schema::{FieldEntry, FieldType, Schema, Term, Value, DATE_TIME_PRECISION_INDEXED};
 use crate::store::{StoreReader, StoreWriter};
 use crate::tokenizer::{FacetTokenizer, PreTokenizedStream, TextAnalyzer, Tokenizer};
-use crate::{DatePrecision, DocId, Document, Opstamp, SegmentComponent};
+use crate::{DocId, Document, Opstamp, SegmentComponent, TantivyError};
 
 /// Computes the initial size of the hash table.
 ///
@@ -25,8 +26,10 @@ use crate::{DatePrecision, DocId, Document, Opstamp, SegmentComponent};
 fn compute_initial_table_size(per_thread_memory_budget: usize) -> crate::Result<usize> {
     let table_memory_upper_bound = per_thread_memory_budget / 3;
     (10..20) // We cap it at 2^19 = 512K capacity.
+        // TODO: There are cases where this limit causes a
+        // reallocation in the hashmap. Check if this affects performance.
         .map(|power| 1 << power)
-        .take_while(|capacity| compute_table_size(*capacity) < table_memory_upper_bound)
+        .take_while(|capacity| compute_table_memory_size(*capacity) < table_memory_upper_bound)
         .last()
         .ok_or_else(|| {
             crate::TantivyError::InvalidArgument(format!(
@@ -84,6 +87,7 @@ impl SegmentWriter {
     ) -> crate::Result<SegmentWriter> {
         let schema = segment.schema();
         let tokenizer_manager = segment.index().tokenizers().clone();
+        let tokenizer_manager_fast_field = segment.index().fast_field_tokenizer().clone();
         let table_size = compute_initial_table_size(memory_budget_in_bytes)?;
         let segment_serializer = SegmentSerializer::for_segment(segment, false)?;
         let per_field_postings_writers = PerFieldPostingsWriter::for_schema(&schema);
@@ -97,21 +101,28 @@ impl SegmentWriter {
                     }
                     _ => None,
                 };
-                text_options
-                    .and_then(|text_index_option| {
-                        let tokenizer_name = &text_index_option.tokenizer();
-                        tokenizer_manager.get(tokenizer_name)
-                    })
-                    .unwrap_or_default()
+                let tokenizer_name = text_options
+                    .map(|text_index_option| text_index_option.tokenizer())
+                    .unwrap_or("default");
+
+                tokenizer_manager.get(tokenizer_name).ok_or_else(|| {
+                    TantivyError::SchemaError(format!(
+                        "Error getting tokenizer for field: {}",
+                        field_entry.name()
+                    ))
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(SegmentWriter {
             max_doc: 0,
             ctx: IndexingContext::new(table_size),
             per_field_postings_writers,
             fieldnorms_writer: FieldNormsWriter::for_schema(&schema),
             segment_serializer,
-            fast_field_writers: FastFieldsWriter::from_schema(&schema),
+            fast_field_writers: FastFieldsWriter::from_schema_and_tokenizer_manager(
+                &schema,
+                tokenizer_manager_fast_field,
+            )?,
             doc_opstamps: Vec::with_capacity(1_000),
             per_field_text_analyzers,
             term_buffer: Term::with_capacity(16),
@@ -139,7 +150,6 @@ impl SegmentWriter {
             self.ctx,
             self.fast_field_writers,
             &self.fieldnorms_writer,
-            &self.schema,
             self.segment_serializer,
             mapping.as_ref(),
         )?;
@@ -182,25 +192,19 @@ impl SegmentWriter {
 
             match field_entry.field_type() {
                 FieldType::Facet(_) => {
+                    let mut facet_tokenizer = FacetTokenizer::default(); // this can be global
                     for value in values {
                         let facet = value.as_facet().ok_or_else(make_schema_error)?;
                         let facet_str = facet.encoded_str();
-                        let mut unordered_term_id_opt = None;
-                        FacetTokenizer
-                            .token_stream(facet_str)
-                            .process(&mut |token| {
-                                term_buffer.set_text(&token.text);
-                                let unordered_term_id =
-                                    postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
-                                // TODO pass indexing context directly in subscribe function
-                                unordered_term_id_opt = Some(unordered_term_id);
-                            });
-                        if let Some(unordered_term_id) = unordered_term_id_opt {
-                            self.fast_field_writers
-                                .get_term_id_writer_mut(field)
-                                .expect("writer for facet missing")
-                                .add_val(unordered_term_id);
-                        }
+                        let mut facet_tokenizer = facet_tokenizer.token_stream(facet_str);
+                        let mut indexing_position = IndexingPosition::default();
+                        postings_writer.index_text(
+                            doc_id,
+                            &mut facet_tokenizer,
+                            term_buffer,
+                            ctx,
+                            &mut indexing_position,
+                        );
                     }
                 }
                 FieldType::Str(_) => {
@@ -208,11 +212,11 @@ impl SegmentWriter {
                     for value in values {
                         let mut token_stream = match value {
                             Value::PreTokStr(tok_str) => {
-                                PreTokenizedStream::from(tok_str.clone()).into()
+                                BoxTokenStream::new(PreTokenizedStream::from(tok_str.clone()))
                             }
                             Value::Str(ref text) => {
                                 let text_analyzer =
-                                    &self.per_field_text_analyzers[field.field_id() as usize];
+                                    &mut self.per_field_text_analyzers[field.field_id() as usize];
                                 text_analyzer.token_stream(text)
                             }
                             _ => {
@@ -227,7 +231,6 @@ impl SegmentWriter {
                             term_buffer,
                             ctx,
                             &mut indexing_position,
-                            self.fast_field_writers.get_term_id_writer_mut(field),
                         );
                     }
                     if field_entry.has_fieldnorms() {
@@ -252,7 +255,8 @@ impl SegmentWriter {
                     for value in values {
                         num_vals += 1;
                         let date_val = value.as_date().ok_or_else(make_schema_error)?;
-                        term_buffer.set_u64(date_val.truncate(DatePrecision::Seconds).to_u64());
+                        term_buffer
+                            .set_u64(date_val.truncate(DATE_TIME_PRECISION_INDEXED).to_u64());
                         postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
                     }
                     if field_entry.has_fieldnorms() {
@@ -308,7 +312,8 @@ impl SegmentWriter {
                     }
                 }
                 FieldType::JsonObject(json_options) => {
-                    let text_analyzer = &self.per_field_text_analyzers[field.field_id() as usize];
+                    let text_analyzer =
+                        &mut self.per_field_text_analyzers[field.field_id() as usize];
                     let json_values_it =
                         values.map(|value| value.as_json().ok_or_else(make_schema_error));
                     index_json_values(
@@ -342,12 +347,12 @@ impl SegmentWriter {
     ///
     /// As a user, you should rather use `IndexWriter`'s add_document.
     pub fn add_document(&mut self, add_operation: AddOperation) -> crate::Result<()> {
-        let doc = add_operation.document;
-        self.doc_opstamps.push(add_operation.opstamp);
-        self.fast_field_writers.add_document(&doc)?;
-        self.index_document(&doc)?;
+        let AddOperation { document, opstamp } = add_operation;
+        self.doc_opstamps.push(opstamp);
+        self.fast_field_writers.add_document(&document)?;
+        self.index_document(&document)?;
         let doc_writer = self.segment_serializer.get_store_writer();
-        doc_writer.store(&doc, &self.schema)?;
+        doc_writer.store(&document, &self.schema)?;
         self.max_doc += 1;
         Ok(())
     }
@@ -383,7 +388,6 @@ fn remap_and_write(
     ctx: IndexingContext,
     fast_field_writers: FastFieldsWriter,
     fieldnorms_writer: &FieldNormsWriter,
-    schema: &Schema,
     mut serializer: SegmentSerializer,
     doc_id_map: Option<&DocIdMapping>,
 ) -> crate::Result<()> {
@@ -395,20 +399,15 @@ fn remap_and_write(
         .segment()
         .open_read(SegmentComponent::FieldNorms)?;
     let fieldnorm_readers = FieldNormReaders::open(fieldnorm_data)?;
-    let term_ord_map = serialize_postings(
+    serialize_postings(
         ctx,
         per_field_postings_writers,
         fieldnorm_readers,
         doc_id_map,
-        schema,
         serializer.get_postings_serializer(),
     )?;
     debug!("fastfield-serialize");
-    fast_field_writers.serialize(
-        serializer.get_fast_field_serializer(),
-        &term_ord_map,
-        doc_id_map,
-    )?;
+    fast_field_writers.serialize(serializer.get_fast_field_write(), doc_id_map)?;
 
     // finalize temp docstore and create version, which reflects the doc_id_map
     if let Some(doc_id_map) = doc_id_map {
@@ -446,15 +445,19 @@ fn remap_and_write(
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+
+    use tempfile::TempDir;
 
     use super::compute_initial_table_size;
     use crate::collector::Count;
+    use crate::core::json_utils::JsonTermWriter;
     use crate::directory::RamDirectory;
-    use crate::indexer::json_term_writer::JsonTermWriter;
     use crate::postings::TermInfo;
     use crate::query::PhraseQuery;
-    use crate::schema::{IndexRecordOption, Schema, Type, STORED, STRING, TEXT};
+    use crate::schema::{
+        IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Type, STORED, STRING, TEXT,
+    };
     use crate::store::{Compressor, StoreReader, StoreWriter};
     use crate::time::format_description::well_known::Rfc3339;
     use crate::time::OffsetDateTime;
@@ -467,7 +470,7 @@ mod tests {
     fn test_hashmap_size() {
         assert_eq!(compute_initial_table_size(100_000).unwrap(), 1 << 11);
         assert_eq!(compute_initial_table_size(1_000_000).unwrap(), 1 << 14);
-        assert_eq!(compute_initial_table_size(10_000_000).unwrap(), 1 << 17);
+        assert_eq!(compute_initial_table_size(15_000_000).unwrap(), 1 << 18);
         assert_eq!(compute_initial_table_size(1_000_000_000).unwrap(), 1 << 19);
         assert_eq!(compute_initial_table_size(4_000_000_000).unwrap(), 1 << 19);
     }
@@ -563,14 +566,20 @@ mod tests {
         json_term_writer.push_path_segment("bool");
         json_term_writer.set_fast_value(true);
         assert!(term_stream.advance());
-        assert_eq!(term_stream.key(), json_term_writer.term().value_bytes());
+        assert_eq!(
+            term_stream.key(),
+            json_term_writer.term().serialized_value_bytes()
+        );
 
         json_term_writer.pop_path_segment();
         json_term_writer.push_path_segment("complexobject");
         json_term_writer.push_path_segment("field.with.dot");
-        json_term_writer.set_fast_value(1u64);
+        json_term_writer.set_fast_value(1i64);
         assert!(term_stream.advance());
-        assert_eq!(term_stream.key(), json_term_writer.term().value_bytes());
+        assert_eq!(
+            term_stream.key(),
+            json_term_writer.term().serialized_value_bytes()
+        );
 
         json_term_writer.pop_path_segment();
         json_term_writer.pop_path_segment();
@@ -579,55 +588,85 @@ mod tests {
             OffsetDateTime::parse("1985-04-12T23:20:50.52Z", &Rfc3339).unwrap(),
         ));
         assert!(term_stream.advance());
-        assert_eq!(term_stream.key(), json_term_writer.term().value_bytes());
+        assert_eq!(
+            term_stream.key(),
+            json_term_writer.term().serialized_value_bytes()
+        );
 
         json_term_writer.pop_path_segment();
         json_term_writer.push_path_segment("float");
         json_term_writer.set_fast_value(-0.2f64);
         assert!(term_stream.advance());
-        assert_eq!(term_stream.key(), json_term_writer.term().value_bytes());
+        assert_eq!(
+            term_stream.key(),
+            json_term_writer.term().serialized_value_bytes()
+        );
 
         json_term_writer.pop_path_segment();
         json_term_writer.push_path_segment("my_arr");
-        json_term_writer.set_fast_value(2u64);
+        json_term_writer.set_fast_value(2i64);
         assert!(term_stream.advance());
-        assert_eq!(term_stream.key(), json_term_writer.term().value_bytes());
+        assert_eq!(
+            term_stream.key(),
+            json_term_writer.term().serialized_value_bytes()
+        );
 
-        json_term_writer.set_fast_value(3u64);
+        json_term_writer.set_fast_value(3i64);
         assert!(term_stream.advance());
-        assert_eq!(term_stream.key(), json_term_writer.term().value_bytes());
+        assert_eq!(
+            term_stream.key(),
+            json_term_writer.term().serialized_value_bytes()
+        );
 
-        json_term_writer.set_fast_value(4u64);
+        json_term_writer.set_fast_value(4i64);
         assert!(term_stream.advance());
-        assert_eq!(term_stream.key(), json_term_writer.term().value_bytes());
+        assert_eq!(
+            term_stream.key(),
+            json_term_writer.term().serialized_value_bytes()
+        );
 
         json_term_writer.push_path_segment("my_key");
         json_term_writer.set_str("tokens");
         assert!(term_stream.advance());
-        assert_eq!(term_stream.key(), json_term_writer.term().value_bytes());
+        assert_eq!(
+            term_stream.key(),
+            json_term_writer.term().serialized_value_bytes()
+        );
 
         json_term_writer.set_str("two");
         assert!(term_stream.advance());
-        assert_eq!(term_stream.key(), json_term_writer.term().value_bytes());
+        assert_eq!(
+            term_stream.key(),
+            json_term_writer.term().serialized_value_bytes()
+        );
 
         json_term_writer.pop_path_segment();
         json_term_writer.pop_path_segment();
         json_term_writer.push_path_segment("signed");
         json_term_writer.set_fast_value(-2i64);
         assert!(term_stream.advance());
-        assert_eq!(term_stream.key(), json_term_writer.term().value_bytes());
+        assert_eq!(
+            term_stream.key(),
+            json_term_writer.term().serialized_value_bytes()
+        );
 
         json_term_writer.pop_path_segment();
         json_term_writer.push_path_segment("toto");
         json_term_writer.set_str("titi");
         assert!(term_stream.advance());
-        assert_eq!(term_stream.key(), json_term_writer.term().value_bytes());
+        assert_eq!(
+            term_stream.key(),
+            json_term_writer.term().serialized_value_bytes()
+        );
 
         json_term_writer.pop_path_segment();
         json_term_writer.push_path_segment("unsigned");
-        json_term_writer.set_fast_value(1u64);
+        json_term_writer.set_fast_value(1i64);
         assert!(term_stream.advance());
-        assert_eq!(term_stream.key(), json_term_writer.term().value_bytes());
+        assert_eq!(
+            term_stream.key(),
+            json_term_writer.term().serialized_value_bytes()
+        );
         assert!(!term_stream.advance());
     }
 
@@ -834,20 +873,23 @@ mod tests {
         // This is a bit of a contrived example.
         let tokens = PreTokenizedString {
             text: "contrived-example".to_string(), //< I can't think of a use case where this corner case happens in real life.
-            tokens: vec![Token { // Not the last token, yet ends after the last token.
-                offset_from: 0,
-                offset_to: 14,
-                position: 0,
-                text: "long_token".to_string(),
-                position_length: 3,
-            },
-            Token {
-                offset_from: 0,
-                offset_to: 14,
-                position: 1,
-                text: "short".to_string(),
-                position_length: 1,
-            }],
+            tokens: vec![
+                Token {
+                    // Not the last token, yet ends after the last token.
+                    offset_from: 0,
+                    offset_to: 14,
+                    position: 0,
+                    text: "long_token".to_string(),
+                    position_length: 3,
+                },
+                Token {
+                    offset_from: 0,
+                    offset_to: 14,
+                    position: 1,
+                    text: "short".to_string(),
+                    position_length: 1,
+                },
+            ],
         };
         doc.add_pre_tokenized_text(text, tokens);
         doc.add_text(text, "hello");
@@ -868,5 +910,33 @@ mod tests {
         let mut positions = Vec::new();
         postings.positions(&mut positions);
         assert_eq!(positions, &[4]); //< as opposed to 3 if we had a position length of 1.
+    }
+
+    #[test]
+    fn test_show_error_when_tokenizer_not_registered() {
+        let text_field_indexing = TextFieldIndexing::default()
+            .set_tokenizer("custom_en")
+            .set_index_option(IndexRecordOption::WithFreqsAndPositions);
+        let text_options = TextOptions::default()
+            .set_indexing_options(text_field_indexing)
+            .set_stored();
+        let mut schema_builder = Schema::builder();
+        schema_builder.add_text_field("title", text_options);
+        let schema = schema_builder.build();
+        let tempdir = TempDir::new().unwrap();
+        let tempdir_path = PathBuf::from(tempdir.path());
+        Index::create_in_dir(&tempdir_path, schema).unwrap();
+        let index = Index::open_in_dir(tempdir_path).unwrap();
+        let schema = index.schema();
+        let mut index_writer = index.writer(50_000_000).unwrap();
+        let title = schema.get_field("title").unwrap();
+        let mut document = Document::default();
+        document.add_text(title, "The Old Man and the Sea");
+        index_writer.add_document(document).unwrap();
+        let error = index_writer.commit().unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Schema error: 'Error getting tokenizer for field: title'"
+        );
     }
 }

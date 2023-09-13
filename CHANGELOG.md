@@ -1,3 +1,119 @@
+Tantivy 0.21
+================================
+#### Bugfixes
+- Fix track fast field memory consumption, which led to higher memory consumption than the budget allowed during indexing [#2148](https://github.com/quickwit-oss/tantivy/issues/2148)[#2147](https://github.com/quickwit-oss/tantivy/issues/2147)(@PSeitz)
+- Fix a regression from 0.20 where sort index by date wasn't working anymore [#2124](https://github.com/quickwit-oss/tantivy/issues/2124)(@PSeitz)
+- Fix getting the root facet on the `FacetCollector`. [#2086](https://github.com/quickwit-oss/tantivy/issues/2086)(@adamreichold)
+- Align numerical type priority order of columnar and query. [#2088](https://github.com/quickwit-oss/tantivy/issues/2088)(@fmassot)
+#### Breaking Changes
+- Remove support for Brotli and Snappy compression [#2123](https://github.com/quickwit-oss/tantivy/issues/2123)(@adamreichold)
+#### Features/Improvements
+- Implement lenient query parser [#2129](https://github.com/quickwit-oss/tantivy/pull/2129)(@trinity-1686a)
+- order_by_u64_field and order_by_fast_field allow sorting in ascending and descending order [#2111](https://github.com/quickwit-oss/tantivy/issues/2111)(@naveenann)
+- Allow dynamic filters in text analyzer builder [#2110](https://github.com/quickwit-oss/tantivy/issues/2110)(@fulmicoton @fmassot)
+- **Aggregation**
+  - Add missing parameter for term aggregation [#2149](https://github.com/quickwit-oss/tantivy/issues/2149)[#2103](https://github.com/quickwit-oss/tantivy/issues/2103)(@PSeitz)
+  - Add missing parameter for percentiles [#2157](https://github.com/quickwit-oss/tantivy/issues/2157)(@PSeitz)
+  - Add missing parameter for stats,min,max,count,sum,avg [#2151](https://github.com/quickwit-oss/tantivy/issues/2151)(@PSeitz)
+  - Improve aggregation deserialization error message [#2150](https://github.com/quickwit-oss/tantivy/issues/2150)(@PSeitz)
+  - Add validation for type Bytes to term_agg [#2077](https://github.com/quickwit-oss/tantivy/issues/2077)(@PSeitz)
+  - Alternative mixed field collection [#2135](https://github.com/quickwit-oss/tantivy/issues/2135)(@PSeitz)
+- Add missing query_terms impl for TermSetQuery. [#2120](https://github.com/quickwit-oss/tantivy/issues/2120)(@adamreichold)
+- Minor improvements to OwnedBytes [#2134](https://github.com/quickwit-oss/tantivy/issues/2134)(@adamreichold)
+- Remove allocations in split compound words [#2080](https://github.com/quickwit-oss/tantivy/issues/2080)(@PSeitz)
+- Ngram tokenizer now returns an error with invalid arguments [#2102](https://github.com/quickwit-oss/tantivy/issues/2102)(@fmassot)
+- Make TextAnalyzerBuilder public [#2097](https://github.com/quickwit-oss/tantivy/issues/2097)(@adamreichold)
+- Return an error when tokenizer is not found while indexing [#2093](https://github.com/quickwit-oss/tantivy/issues/2093)(@naveenann)
+- Delayed column opening during merge [#2132](https://github.com/quickwit-oss/tantivy/issues/2132)(@PSeitz)
+
+Tantivy 0.20.2
+================================
+- Align numerical type priority order on the search side.  [#2088](https://github.com/quickwit-oss/tantivy/issues/2088) (@fmassot)
+- Fix is_child_of function not considering the root facet. [#2086](https://github.com/quickwit-oss/tantivy/issues/2086) (@adamreichhold)
+
+Tantivy 0.20.1
+================================
+- Fix building on windows with mmap [#2070](https://github.com/quickwit-oss/tantivy/issues/2070) (@ChillFish8)
+
+Tantivy 0.20
+================================
+#### Bugfixes
+- Fix phrase queries with slop (slop supports now transpositions, algorithm that carries slop so far for num terms > 2) [#2031](https://github.com/quickwit-oss/tantivy/issues/2031)[#2020](https://github.com/quickwit-oss/tantivy/issues/2020)(@PSeitz)
+- Handle error for exists on MMapDirectory [#1988](https://github.com/quickwit-oss/tantivy/issues/1988) (@PSeitz)
+- Aggregation
+  - Fix min doc_count empty merge bug [#2057](https://github.com/quickwit-oss/tantivy/issues/2057) (@PSeitz)
+  - Fix: Sort order for term aggregations (sort order on key was inverted) [#1858](https://github.com/quickwit-oss/tantivy/issues/1858) (@PSeitz)
+
+#### Features/Improvements
+- Add PhrasePrefixQuery [#1842](https://github.com/quickwit-oss/tantivy/issues/1842) (@trinity-1686a)
+- Add `coerce` option for text and numbers types (convert the value instead of returning an error during indexing) [#1904](https://github.com/quickwit-oss/tantivy/issues/1904) (@PSeitz)
+- Add regex tokenizer [#1759](https://github.com/quickwit-oss/tantivy/issues/1759)(@mkleen)
+- Move tokenizer API to seperate crate. Having a seperate crate with a stable API will allow us to use tokenizers with different tantivy versions. [#1767](https://github.com/quickwit-oss/tantivy/issues/1767) (@PSeitz)
+- **Columnar crate**: New fast field handling (@fulmicoton @PSeitz) [#1806](https://github.com/quickwit-oss/tantivy/issues/1806)[#1809](https://github.com/quickwit-oss/tantivy/issues/1809)
+  - Support for fast fields with optional values. Previously tantivy supported only single-valued and multi-value fast fields. The encoding of optional fast fields is now very compact.
+  - Fast field Support for JSON (schemaless fast fields). Support multiple types on the same column. [#1876](https://github.com/quickwit-oss/tantivy/issues/1876) (@fulmicoton)
+  - Unified access for fast fields over different cardinalities.
+  - Unified storage for typed and untyped fields.
+  - Move fastfield codecs into columnar. [#1782](https://github.com/quickwit-oss/tantivy/issues/1782) (@fulmicoton)
+  - Sparse dense index for optional values [#1716](https://github.com/quickwit-oss/tantivy/issues/1716) (@PSeitz)
+  - Switch to nanosecond precision in DateTime fastfield [#2016](https://github.com/quickwit-oss/tantivy/issues/2016) (@PSeitz)
+- **Aggregation**
+  - Add `date_histogram` aggregation (only `fixed_interval` for now) [#1900](https://github.com/quickwit-oss/tantivy/issues/1900) (@PSeitz)
+  - Add `percentiles` aggregations [#1984](https://github.com/quickwit-oss/tantivy/issues/1984) (@PSeitz)
+  - [**breaking**] Drop JSON support on intermediate agg result (we use postcard as format in `quickwit` to send intermediate results) [#1992](https://github.com/quickwit-oss/tantivy/issues/1992) (@PSeitz)
+  - Set memory limit in bytes for aggregations after which they abort (Previously there was only the bucket limit) [#1942](https://github.com/quickwit-oss/tantivy/issues/1942)[#1957](https://github.com/quickwit-oss/tantivy/issues/1957)(@PSeitz)
+  - Add support for u64,i64,f64 fields in term aggregation [#1883](https://github.com/quickwit-oss/tantivy/issues/1883) (@PSeitz)
+  - Allow histogram bounds to be passed as Rfc3339 [#2076](https://github.com/quickwit-oss/tantivy/issues/2076) (@PSeitz)
+  - Add count, min, max, and sum aggregations [#1794](https://github.com/quickwit-oss/tantivy/issues/1794) (@guilload)
+  - Switch to Aggregation without serde_untagged => better deserialization errors. [#2003](https://github.com/quickwit-oss/tantivy/issues/2003) (@PSeitz)
+  - Switch to ms in histogram for date type (ES compatibility) [#2045](https://github.com/quickwit-oss/tantivy/issues/2045) (@PSeitz)
+  - Reduce term aggregation memory consumption [#2013](https://github.com/quickwit-oss/tantivy/issues/2013) (@PSeitz)
+  - Reduce agg memory consumption: Replace generic aggregation collector (which has a high memory requirement per instance) in aggregation tree with optimized versions behind a trait.
+  - Split term collection count and sub_agg (Faster term agg with less memory consumption for cases without sub-aggs) [#1921](https://github.com/quickwit-oss/tantivy/issues/1921) (@PSeitz)
+  - Schemaless aggregations: In combination with stacker tantivy supports now schemaless aggregations via the JSON type.
+    - Add aggregation support for JSON type [#1888](https://github.com/quickwit-oss/tantivy/issues/1888) (@PSeitz)
+    - Mixed types support on JSON fields in aggs [#1971](https://github.com/quickwit-oss/tantivy/issues/1971) (@PSeitz)
+  - Perf: Fetch blocks of vals in aggregation for all cardinality [#1950](https://github.com/quickwit-oss/tantivy/issues/1950) (@PSeitz)
+  - Allow histogram bounds to be passed as Rfc3339 [#2076](https://github.com/quickwit-oss/tantivy/issues/2076) (@PSeitz)
+- `Searcher` with disabled scoring via `EnableScoring::Disabled` [#1780](https://github.com/quickwit-oss/tantivy/issues/1780) (@shikhar)
+- Enable tokenizer on json fields [#2053](https://github.com/quickwit-oss/tantivy/issues/2053) (@PSeitz)
+- Enforcing "NOT" and "-" queries consistency in UserInputAst [#1609](https://github.com/quickwit-oss/tantivy/issues/1609) (@bazhenov)
+- Faster indexing
+  - Refactor tokenization pipeline to use GATs [#1924](https://github.com/quickwit-oss/tantivy/issues/1924) (@trinity-1686a)
+  - Faster term hash map [#2058](https://github.com/quickwit-oss/tantivy/issues/2058)[#1940](https://github.com/quickwit-oss/tantivy/issues/1940) (@PSeitz)
+  - tokenizer-api: reduce Tokenizer allocation overhead [#2062](https://github.com/quickwit-oss/tantivy/issues/2062) (@PSeitz)
+  - Refactor vint [#2010](https://github.com/quickwit-oss/tantivy/issues/2010) (@PSeitz)
+- Faster search
+  - Work in batches of docs on the SegmentCollector (Only for cases without score for now) [#1937](https://github.com/quickwit-oss/tantivy/issues/1937) (@PSeitz)
+  - Faster fast field range queries using SIMD [#1954](https://github.com/quickwit-oss/tantivy/issues/1954) (@fulmicoton)
+  - Improve fast field range query performance [#1864](https://github.com/quickwit-oss/tantivy/issues/1864) (@PSeitz)
+- Make BM25 scoring more flexible [#1855](https://github.com/quickwit-oss/tantivy/issues/1855) (@alexcole)
+- Switch fs2 to fs4 as it is now unmaintained and does not support illumos [#1944](https://github.com/quickwit-oss/tantivy/issues/1944) (@Toasterson)
+- Made BooleanWeight and BoostWeight public [#1991](https://github.com/quickwit-oss/tantivy/issues/1991) (@fulmicoton)
+- Make index compatible with virtual drives on Windows [#1843](https://github.com/quickwit-oss/tantivy/issues/1843) (@gyk)
+- Add stop words for Hungarian language [#2069](https://github.com/quickwit-oss/tantivy/issues/2069) (@tnxbutno)
+- Auto downgrade index record option, instead of vint error [#1857](https://github.com/quickwit-oss/tantivy/issues/1857) (@PSeitz)
+- Enable range query on fast field for u64 compatible types [#1762](https://github.com/quickwit-oss/tantivy/issues/1762) (@PSeitz) [#1876]
+- sstable
+  - Isolating sstable and stacker in independant crates. [#1718](https://github.com/quickwit-oss/tantivy/issues/1718) (@fulmicoton)
+  - New sstable format [#1943](https://github.com/quickwit-oss/tantivy/issues/1943)[#1953](https://github.com/quickwit-oss/tantivy/issues/1953) (@trinity-1686a)
+  - Use DeltaReader directly to implement Dictionnary::ord_to_term [#1928](https://github.com/quickwit-oss/tantivy/issues/1928) (@trinity-1686a)
+  - Use DeltaReader directly to implement Dictionnary::term_ord [#1925](https://github.com/quickwit-oss/tantivy/issues/1925) (@trinity-1686a)
+- Add seperate tokenizer manager for fast fields [#2019](https://github.com/quickwit-oss/tantivy/issues/2019) (@PSeitz)
+- Make construction of LevenshteinAutomatonBuilder for FuzzyTermQuery instances lazy. [#1756](https://github.com/quickwit-oss/tantivy/issues/1756) (@adamreichold)
+- Added support for madvise when opening an mmaped Index [#2036](https://github.com/quickwit-oss/tantivy/issues/2036) (@fulmicoton)
+- Rename `DatePrecision` to `DateTimePrecision` [#2051](https://github.com/quickwit-oss/tantivy/issues/2051) (@guilload)
+- Query Parser
+  - Quotation mark can now be used for phrase queries. [#2050](https://github.com/quickwit-oss/tantivy/issues/2050) (@fulmicoton)
+  - PhrasePrefixQuery is supported in the query parser via: `field:"phrase ter"*` [#2044](https://github.com/quickwit-oss/tantivy/issues/2044) (@adamreichold)
+- Docs
+  - Update examples for literate docs [#1880](https://github.com/quickwit-oss/tantivy/issues/1880) (@PSeitz)
+  - Add ip field example [#1775](https://github.com/quickwit-oss/tantivy/issues/1775) (@PSeitz)
+  - Fix doc store cache documentation [#1821](https://github.com/quickwit-oss/tantivy/issues/1821) (@PSeitz)
+  - Fix BooleanQuery document [#1999](https://github.com/quickwit-oss/tantivy/issues/1999) (@RT_Enzyme)
+  - Update comments in the faceted search example [#1737](https://github.com/quickwit-oss/tantivy/issues/1737) (@DawChihLiou)
+
+
 Tantivy 0.19
 ================================
 #### Bugfixes

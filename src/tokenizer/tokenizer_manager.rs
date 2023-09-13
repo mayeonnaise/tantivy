@@ -58,21 +58,23 @@ impl Default for TokenizerManager {
     /// the default pre-configured tokenizers of `tantivy`.
     fn default() -> TokenizerManager {
         let manager = TokenizerManager::new();
-        manager.register("raw", RawTokenizer);
+        manager.register("raw", RawTokenizer::default());
         manager.register(
             "default",
-            TextAnalyzer::from(SimpleTokenizer)
+            TextAnalyzer::builder(SimpleTokenizer::default())
                 .filter(RemoveLongFilter::limit(40))
-                .filter(LowerCaser),
+                .filter(LowerCaser)
+                .build(),
         );
         manager.register(
             "en_stem",
-            TextAnalyzer::from(SimpleTokenizer)
+            TextAnalyzer::builder(SimpleTokenizer::default())
                 .filter(RemoveLongFilter::limit(40))
                 .filter(LowerCaser)
-                .filter(Stemmer::new(Language::English)),
+                .filter(Stemmer::new(Language::English))
+                .build(),
         );
-        manager.register("whitespace", WhitespaceTokenizer);
+        manager.register("whitespace", WhitespaceTokenizer::default());
         manager
     }
 }

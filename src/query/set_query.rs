@@ -47,8 +47,12 @@ impl TermSetQuery {
             // In practice this won't fail because:
             // - we are writing to memory, so no IoError
             // - Terms are ordered
-            let map = Map::from_iter(sorted_terms.iter().map(|key| (key.value_bytes(), 0)))
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            let map = Map::from_iter(
+                sorted_terms
+                    .iter()
+                    .map(|key| (key.serialized_value_bytes(), 0)),
+            )
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
             sub_queries.push((
                 Occur::Should,
@@ -67,6 +71,14 @@ impl TermSetQuery {
 impl Query for TermSetQuery {
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         Ok(Box::new(self.specialized_weight(enable_scoring.schema())?))
+    }
+
+    fn query_terms<'a>(&'a self, visitor: &mut dyn FnMut(&'a Term, bool)) {
+        for terms in self.terms_map.values() {
+            for term in terms {
+                visitor(term, false);
+            }
+        }
     }
 }
 

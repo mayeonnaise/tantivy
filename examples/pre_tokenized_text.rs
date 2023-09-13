@@ -12,12 +12,13 @@
 use tantivy::collector::{Count, TopDocs};
 use tantivy::query::TermQuery;
 use tantivy::schema::*;
-use tantivy::tokenizer::{PreTokenizedString, SimpleTokenizer, Token, Tokenizer};
+use tantivy::tokenizer::{PreTokenizedString, SimpleTokenizer, Token, TokenStream, Tokenizer};
 use tantivy::{doc, Index, ReloadPolicy};
 use tempfile::TempDir;
 
 fn pre_tokenize_text(text: &str) -> Vec<Token> {
-    let mut token_stream = SimpleTokenizer.token_stream(text);
+    let mut tokenizer = SimpleTokenizer::default();
+    let mut token_stream = tokenizer.token_stream(text);
     let mut tokens = vec![];
     while token_stream.advance() {
         tokens.push(token_stream.token().clone());

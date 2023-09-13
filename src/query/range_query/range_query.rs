@@ -1,29 +1,21 @@
 use std::io;
+use std::net::Ipv6Addr;
 use std::ops::{Bound, Range};
 
+use columnar::MonotonicallyMappableToU128;
 use common::{BinarySerializable, BitSet};
 
+use super::map_bound;
 use super::range_query_u64_fastfield::FastFieldRangeWeight;
 use crate::core::SegmentReader;
 use crate::error::TantivyError;
 use crate::query::explanation::does_not_match;
 use crate::query::range_query::range_query_ip_fastfield::IPFastFieldRangeWeight;
+use crate::query::range_query::{is_type_valid_for_fastfield_range_query, map_bound_res};
 use crate::query::{BitSetDocSet, ConstScorer, EnableScoring, Explanation, Query, Scorer, Weight};
 use crate::schema::{Field, IndexRecordOption, Term, Type};
 use crate::termdict::{TermDictionary, TermStreamer};
 use crate::{DateTime, DocId, Score};
-
-pub(crate) fn map_bound<TFrom, TTo, Transform: Fn(&TFrom) -> TTo>(
-    bound: &Bound<TFrom>,
-    transform: &Transform,
-) -> Bound<TTo> {
-    use self::Bound::*;
-    match bound {
-        Excluded(ref from_val) => Excluded(transform(from_val)),
-        Included(ref from_val) => Included(transform(from_val)),
-        Unbounded => Unbounded,
-    }
-}
 
 /// `RangeQuery` matches all documents that have at least one term within a defined range.
 ///
@@ -56,7 +48,7 @@ pub(crate) fn map_bound<TFrom, TTo, Transform: Fn(&TFrom) -> TTo>(
 /// let schema = schema_builder.build();
 ///
 /// let index = Index::create_in_ram(schema);
-/// let mut index_writer = index.writer_with_num_threads(1, 10_000_000)?;
+/// let mut index_writer = index.writer_with_num_threads(1, 20_000_000)?;
 /// for year in 1950u64..2017u64 {
 ///     let num_docs_within_year = 10 + (year - 1950) * (year - 1950);
 ///     for _ in 0..num_docs_within_year {
@@ -78,8 +70,9 @@ pub(crate) fn map_bound<TFrom, TTo, Transform: Fn(&TFrom) -> TTo>(
 pub struct RangeQuery {
     field: String,
     value_type: Type,
-    left_bound: Bound<Vec<u8>>,
-    right_bound: Bound<Vec<u8>>,
+    lower_bound: Bound<Vec<u8>>,
+    upper_bound: Bound<Vec<u8>>,
+    limit: Option<u64>,
 }
 
 impl RangeQuery {
@@ -90,15 +83,16 @@ impl RangeQuery {
     pub fn new_term_bounds(
         field: String,
         value_type: Type,
-        left_bound: &Bound<Term>,
-        right_bound: &Bound<Term>,
+        lower_bound: &Bound<Term>,
+        upper_bound: &Bound<Term>,
     ) -> RangeQuery {
-        let verify_and_unwrap_term = |val: &Term| val.value_bytes().to_owned();
+        let verify_and_unwrap_term = |val: &Term| val.serialized_value_bytes().to_owned();
         RangeQuery {
             field,
             value_type,
-            left_bound: map_bound(left_bound, &verify_and_unwrap_term),
-            right_bound: map_bound(right_bound, &verify_and_unwrap_term),
+            lower_bound: map_bound(lower_bound, verify_and_unwrap_term),
+            upper_bound: map_bound(upper_bound, verify_and_unwrap_term),
+            limit: None,
         }
     }
 
@@ -123,19 +117,20 @@ impl RangeQuery {
     /// will panic when the `Weight` object is created.
     pub fn new_i64_bounds(
         field: String,
-        left_bound: Bound<i64>,
-        right_bound: Bound<i64>,
+        lower_bound: Bound<i64>,
+        upper_bound: Bound<i64>,
     ) -> RangeQuery {
         let make_term_val = |val: &i64| {
             Term::from_field_i64(Field::from_field_id(0), *val)
-                .value_bytes()
+                .serialized_value_bytes()
                 .to_owned()
         };
         RangeQuery {
             field,
             value_type: Type::I64,
-            left_bound: map_bound(&left_bound, &make_term_val),
-            right_bound: map_bound(&right_bound, &make_term_val),
+            lower_bound: map_bound(&lower_bound, make_term_val),
+            upper_bound: map_bound(&upper_bound, make_term_val),
+            limit: None,
         }
     }
 
@@ -160,19 +155,20 @@ impl RangeQuery {
     /// will panic when the `Weight` object is created.
     pub fn new_f64_bounds(
         field: String,
-        left_bound: Bound<f64>,
-        right_bound: Bound<f64>,
+        lower_bound: Bound<f64>,
+        upper_bound: Bound<f64>,
     ) -> RangeQuery {
         let make_term_val = |val: &f64| {
             Term::from_field_f64(Field::from_field_id(0), *val)
-                .value_bytes()
+                .serialized_value_bytes()
                 .to_owned()
         };
         RangeQuery {
             field,
             value_type: Type::F64,
-            left_bound: map_bound(&left_bound, &make_term_val),
-            right_bound: map_bound(&right_bound, &make_term_val),
+            lower_bound: map_bound(&lower_bound, make_term_val),
+            upper_bound: map_bound(&upper_bound, make_term_val),
+            limit: None,
         }
     }
 
@@ -185,19 +181,43 @@ impl RangeQuery {
     /// will panic when the `Weight` object is created.
     pub fn new_u64_bounds(
         field: String,
-        left_bound: Bound<u64>,
-        right_bound: Bound<u64>,
+        lower_bound: Bound<u64>,
+        upper_bound: Bound<u64>,
     ) -> RangeQuery {
         let make_term_val = |val: &u64| {
             Term::from_field_u64(Field::from_field_id(0), *val)
-                .value_bytes()
+                .serialized_value_bytes()
                 .to_owned()
         };
         RangeQuery {
             field,
             value_type: Type::U64,
-            left_bound: map_bound(&left_bound, &make_term_val),
-            right_bound: map_bound(&right_bound, &make_term_val),
+            lower_bound: map_bound(&lower_bound, make_term_val),
+            upper_bound: map_bound(&upper_bound, make_term_val),
+            limit: None,
+        }
+    }
+
+    /// Create a new `RangeQuery` over a `ip` field.
+    ///
+    /// If the field is not of the type `ip`, tantivy
+    /// will panic when the `Weight` object is created.
+    pub fn new_ip_bounds(
+        field: String,
+        lower_bound: Bound<Ipv6Addr>,
+        upper_bound: Bound<Ipv6Addr>,
+    ) -> RangeQuery {
+        let make_term_val = |val: &Ipv6Addr| {
+            Term::from_field_ip_addr(Field::from_field_id(0), *val)
+                .serialized_value_bytes()
+                .to_owned()
+        };
+        RangeQuery {
+            field,
+            value_type: Type::IpAddr,
+            lower_bound: map_bound(&lower_bound, make_term_val),
+            upper_bound: map_bound(&upper_bound, make_term_val),
+            limit: None,
         }
     }
 
@@ -222,19 +242,20 @@ impl RangeQuery {
     /// will panic when the `Weight` object is created.
     pub fn new_date_bounds(
         field: String,
-        left_bound: Bound<DateTime>,
-        right_bound: Bound<DateTime>,
+        lower_bound: Bound<DateTime>,
+        upper_bound: Bound<DateTime>,
     ) -> RangeQuery {
         let make_term_val = |val: &DateTime| {
             Term::from_field_date(Field::from_field_id(0), *val)
-                .value_bytes()
+                .serialized_value_bytes()
                 .to_owned()
         };
         RangeQuery {
             field,
             value_type: Type::Date,
-            left_bound: map_bound(&left_bound, &make_term_val),
-            right_bound: map_bound(&right_bound, &make_term_val),
+            lower_bound: map_bound(&lower_bound, make_term_val),
+            upper_bound: map_bound(&upper_bound, make_term_val),
+            limit: None,
         }
     }
 
@@ -257,13 +278,18 @@ impl RangeQuery {
     ///
     /// If the field is not of the type `Str`, tantivy
     /// will panic when the `Weight` object is created.
-    pub fn new_str_bounds(field: String, left: Bound<&str>, right: Bound<&str>) -> RangeQuery {
+    pub fn new_str_bounds(
+        field: String,
+        lower_bound: Bound<&str>,
+        upper_bound: Bound<&str>,
+    ) -> RangeQuery {
         let make_term_val = |val: &&str| val.as_bytes().to_vec();
         RangeQuery {
             field,
             value_type: Type::Str,
-            left_bound: map_bound(&left, &make_term_val),
-            right_bound: map_bound(&right, &make_term_val),
+            lower_bound: map_bound(&lower_bound, make_term_val),
+            upper_bound: map_bound(&upper_bound, make_term_val),
+            limit: None,
         }
     }
 
@@ -283,13 +309,13 @@ impl RangeQuery {
     pub fn field(&self) -> &str {
         &self.field
     }
-}
 
-pub(crate) fn is_type_valid_for_fastfield_range_query(typ: Type) -> bool {
-    match typ {
-        Type::U64 | Type::I64 | Type::F64 | Type::Bool | Type::Date => true,
-        Type::IpAddr => true,
-        Type::Str | Type::Facet | Type::Bytes | Type::Json => false,
+    /// Limit the number of term the `RangeQuery` will go through.
+    ///
+    /// This does not limit the number of matching document, only the number of
+    /// different terms that get matched.
+    pub(crate) fn limit(&mut self, limit: u64) {
+        self.limit = Some(limit);
     }
 }
 
@@ -311,18 +337,30 @@ impl Query for RangeQuery {
         let value_type = field_type.value_type();
         if value_type != self.value_type {
             let err_msg = format!(
-                "Create a range query of the type {:?}, when the field given was of type {:?}",
-                self.value_type, value_type
+                "Create a range query of the type {:?}, when the field given was of type \
+                 {value_type:?}",
+                self.value_type
             );
             return Err(TantivyError::SchemaError(err_msg));
         }
 
         if field_type.is_fast() && is_type_valid_for_fastfield_range_query(self.value_type) {
             if field_type.is_ip_addr() {
+                let parse_ip_from_bytes = |data: &Vec<u8>| {
+                    let ip_u128_bytes: [u8; 16] = data.as_slice().try_into().map_err(|_| {
+                        crate::TantivyError::InvalidArgument(
+                            "Expected 8 bytes for ip address".to_string(),
+                        )
+                    })?;
+                    let ip_u128 = u128::from_be_bytes(ip_u128_bytes);
+                    crate::Result::<Ipv6Addr>::Ok(Ipv6Addr::from_u128(ip_u128))
+                };
+                let lower_bound = map_bound_res(&self.lower_bound, parse_ip_from_bytes)?;
+                let upper_bound = map_bound_res(&self.upper_bound, parse_ip_from_bytes)?;
                 Ok(Box::new(IPFastFieldRangeWeight::new(
                     self.field.to_string(),
-                    &self.left_bound,
-                    &self.right_bound,
+                    lower_bound,
+                    upper_bound,
                 )))
             } else {
                 // We run the range query on u64 value space for performance reasons and simpicity
@@ -332,19 +370,20 @@ impl Query for RangeQuery {
                     u64::from_be(BinarySerializable::deserialize(&mut &data[..]).unwrap())
                 };
 
-                let left_bound = map_bound(&self.left_bound, &parse_from_bytes);
-                let right_bound = map_bound(&self.right_bound, &parse_from_bytes);
-                Ok(Box::new(FastFieldRangeWeight::new(
+                let lower_bound = map_bound(&self.lower_bound, parse_from_bytes);
+                let upper_bound = map_bound(&self.upper_bound, parse_from_bytes);
+                Ok(Box::new(FastFieldRangeWeight::new_u64_lenient(
                     self.field.to_string(),
-                    left_bound,
-                    right_bound,
+                    lower_bound,
+                    upper_bound,
                 )))
             }
         } else {
             Ok(Box::new(RangeWeight {
                 field: self.field.to_string(),
-                left_bound: self.left_bound.clone(),
-                right_bound: self.right_bound.clone(),
+                lower_bound: self.lower_bound.clone(),
+                upper_bound: self.upper_bound.clone(),
+                limit: self.limit,
             }))
         }
     }
@@ -352,24 +391,29 @@ impl Query for RangeQuery {
 
 pub struct RangeWeight {
     field: String,
-    left_bound: Bound<Vec<u8>>,
-    right_bound: Bound<Vec<u8>>,
+    lower_bound: Bound<Vec<u8>>,
+    upper_bound: Bound<Vec<u8>>,
+    limit: Option<u64>,
 }
 
 impl RangeWeight {
     fn term_range<'a>(&self, term_dict: &'a TermDictionary) -> io::Result<TermStreamer<'a>> {
         use std::ops::Bound::*;
         let mut term_stream_builder = term_dict.range();
-        term_stream_builder = match self.left_bound {
+        term_stream_builder = match self.lower_bound {
             Included(ref term_val) => term_stream_builder.ge(term_val),
             Excluded(ref term_val) => term_stream_builder.gt(term_val),
             Unbounded => term_stream_builder,
         };
-        term_stream_builder = match self.right_bound {
+        term_stream_builder = match self.upper_bound {
             Included(ref term_val) => term_stream_builder.le(term_val),
             Excluded(ref term_val) => term_stream_builder.lt(term_val),
             Unbounded => term_stream_builder,
         };
+        #[cfg(feature = "quickwit")]
+        if let Some(limit) = self.limit {
+            term_stream_builder = term_stream_builder.limit(limit);
+        }
         term_stream_builder.into_stream()
     }
 }
@@ -382,7 +426,14 @@ impl Weight for RangeWeight {
         let inverted_index = reader.inverted_index(reader.schema().get_field(&self.field)?)?;
         let term_dict = inverted_index.terms();
         let mut term_range = self.term_range(term_dict)?;
+        let mut processed_count = 0;
         while term_range.advance() {
+            if let Some(limit) = self.limit {
+                if limit <= processed_count {
+                    break;
+                }
+            }
+            processed_count += 1;
             let term_info = term_range.value();
             let mut block_segment_postings = inverted_index
                 .read_block_postings_from_terminfo(term_info, IndexRecordOption::Basic)?;
@@ -417,8 +468,11 @@ mod tests {
     use std::ops::Bound;
     use std::str::FromStr;
 
+    use rand::seq::SliceRandom;
+
     use super::RangeQuery;
     use crate::collector::{Count, TopDocs};
+    use crate::indexer::NoMergePolicy;
     use crate::query::QueryParser;
     use crate::schema::{Document, Field, IntoIpv6Addr, Schema, FAST, INDEXED, STORED, TEXT};
     use crate::{doc, Index};
@@ -452,6 +506,38 @@ mod tests {
     }
 
     #[test]
+    fn test_range_query_with_limit() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let year_field = schema_builder.add_u64_field("year", INDEXED);
+        let schema = schema_builder.build();
+
+        let index = Index::create_in_ram(schema);
+        {
+            let mut index_writer = index.writer_for_tests()?;
+            for year in 1950u64..2017u64 {
+                if year == 1963 {
+                    continue;
+                }
+                let num_docs_within_year = 10 + (year - 1950) * (year - 1950);
+                for _ in 0..num_docs_within_year {
+                    index_writer.add_document(doc!(year_field => year))?;
+                }
+            }
+            index_writer.commit()?;
+        }
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+
+        let mut docs_in_the_sixties = RangeQuery::new_u64("year".to_string(), 1960u64..1970u64);
+        docs_in_the_sixties.limit(5);
+
+        // due to the limit and no docs in 1963, it's really only 1960..=1965
+        let count = searcher.search(&docs_in_the_sixties, &Count)?;
+        assert_eq!(count, 836);
+        Ok(())
+    }
+
+    #[test]
     fn test_range_query() -> crate::Result<()> {
         let int_field: Field;
         let schema = {
@@ -462,7 +548,8 @@ mod tests {
 
         let index = Index::create_in_ram(schema);
         {
-            let mut index_writer = index.writer_with_num_threads(2, 6_000_000)?;
+            let mut index_writer = index.writer_with_num_threads(1, 60_000_000)?;
+            index_writer.set_merge_policy(Box::new(NoMergePolicy));
 
             for i in 1..100 {
                 let mut doc = Document::new();
@@ -472,12 +559,16 @@ mod tests {
                     }
                 }
                 index_writer.add_document(doc)?;
+                if i == 10 {
+                    index_writer.commit()?;
+                }
             }
 
             index_writer.commit()?;
         }
         let reader = index.reader().unwrap();
         let searcher = reader.searcher();
+        assert_eq!(searcher.segment_readers().len(), 2);
         let count_multiples =
             |range_query: RangeQuery| searcher.search(&range_query, &Count).unwrap();
 
@@ -523,8 +614,8 @@ mod tests {
 
         let index = Index::create_in_ram(schema);
         {
-            let mut index_writer = index.writer_with_num_threads(2, 6_000_000).unwrap();
-
+            let mut index_writer = index.writer_with_num_threads(1, 60_000_000).unwrap();
+            let mut docs = Vec::new();
             for i in 1..100 {
                 let mut doc = Document::new();
                 for j in 1..100 {
@@ -532,13 +623,23 @@ mod tests {
                         doc.add_f64(float_field, j as f64);
                     }
                 }
-                index_writer.add_document(doc)?;
+                docs.push(doc);
             }
 
+            docs.shuffle(&mut rand::thread_rng());
+            let mut docs_it = docs.into_iter();
+            for doc in (&mut docs_it).take(50) {
+                index_writer.add_document(doc)?;
+            }
+            index_writer.commit()?;
+            for doc in docs_it {
+                index_writer.add_document(doc)?;
+            }
             index_writer.commit()?;
         }
         let reader = index.reader()?;
         let searcher = reader.searcher();
+        assert_eq!(searcher.segment_readers().len(), 2);
         let count_multiples =
             |range_query: RangeQuery| searcher.search(&range_query, &Count).unwrap();
 
@@ -621,7 +722,7 @@ mod tests {
         let ip_addr_2 = IpAddr::from_str("127.0.0.20").unwrap().into_ipv6_addr();
 
         {
-            let mut index_writer = index.writer(3_000_000).unwrap();
+            let mut index_writer = index.writer_for_tests().unwrap();
             for _ in 0..1_000 {
                 index_writer
                     .add_document(doc!(
@@ -638,11 +739,11 @@ mod tests {
                     ))
                     .unwrap();
             }
-
             index_writer.commit().unwrap();
         }
         let reader = index.reader().unwrap();
         let searcher = reader.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
 
         let get_num_hits = |query| {
             let (_top_docs, count) = searcher
