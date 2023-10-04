@@ -4,6 +4,7 @@ use downcast_rs::impl_downcast;
 
 use super::bm25::Bm25StatisticsProvider;
 use super::Weight;
+use crate::query::query_document_tree::QueryDocumentTree;
 use crate::core::searcher::Searcher;
 use crate::query::Explanation;
 use crate::schema::Schema;
@@ -160,6 +161,14 @@ pub trait Query: QueryClone + Send + Sync + downcast_rs::Downcast + fmt::Debug {
     /// Note that there can be multiple instances of any given term
     /// in a query and deduplication must be handled by the visitor.
     fn query_terms<'a>(&'a self, _visitor: &mut dyn FnMut(&'a Term, bool)) {}
+
+    /// Transforms a query into an AST
+    /// 
+    /// By default, a query is converted into an AnyTerm which indicates
+    /// that it should match against all queries
+    fn to_ast(&self) -> QueryDocumentTree {
+        QueryDocumentTree::AnyTerm
+    }
 }
 
 /// Implements `box_clone`.

@@ -25,12 +25,15 @@ mod set_query;
 mod term_query;
 mod union;
 mod weight;
+mod query_document_tree;
 
 #[cfg(test)]
 mod vec_docset;
 
 pub(crate) mod score_combiner;
 pub use query_grammar::Occur;
+
+pub use self::query_document_tree::QueryDocumentTree;
 
 pub use self::all_query::{AllQuery, AllScorer, AllWeight};
 pub use self::automaton_weight::AutomatonWeight;
