@@ -1,5 +1,5 @@
 use super::boolean_weight::BooleanWeight;
-use crate::query::{EnableScoring, Occur, Query, SumWithCoordsCombiner, TermQuery, Weight};
+use crate::query::{EnableScoring, Occur, Query, SumWithCoordsCombiner, TermQuery, Weight, QueryDocumentTree};
 use crate::schema::{IndexRecordOption, Term};
 
 /// The boolean query returns a set of documents
@@ -160,6 +160,41 @@ impl Query for BooleanQuery {
         for (_occur, subquery) in &self.subqueries {
             subquery.query_terms(visitor);
         }
+    }
+
+    fn to_ast(&self) -> QueryDocumentTree {
+        let (mut must_count, mut must_not_count) =
+            <(usize, usize)>::default();
+        for (occur, _) in self.clauses() {
+            match occur {
+                Occur::Should => continue,
+                Occur::Must => must_count += 1,
+                Occur::MustNot => must_not_count += 1,
+            }
+        }
+
+        if must_count >= 1 {
+            let conjunction_clauses: Vec<QueryDocumentTree> = self
+                .clauses()
+                .iter()
+                .filter(|(occur, _)| *occur == Occur::Must)
+                .map(|(_, clause)| clause.to_ast())
+                .collect();
+            return QueryDocumentTree::Conjunction(conjunction_clauses);
+        }
+
+        if must_not_count >= 1 {
+            return QueryDocumentTree::AnyTerm;
+        }
+
+        let disjunction_clauses: Vec<QueryDocumentTree> = self
+            .clauses()
+            .iter()
+            .filter(|(occur, _)| *occur == Occur::Should)
+            .map(|(_, clause)| clause.to_ast())
+            .collect();
+
+        return QueryDocumentTree::Disjunction(disjunction_clauses);
     }
 }
 
