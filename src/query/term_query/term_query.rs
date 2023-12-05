@@ -127,6 +127,10 @@ impl Query for TermQuery {
     fn query_terms<'a>(&'a self, visitor: &mut dyn FnMut(&'a Term, bool)) {
         visitor(&self.term, false);
     }
+    
+    fn to_ast(&self) -> crate::query::QueryDocumentTree {
+        crate::query::QueryDocumentTree::Term(self.term.clone())
+    }
 }
 
 #[cfg(test)]
