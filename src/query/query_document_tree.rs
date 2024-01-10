@@ -6,6 +6,7 @@ use super::{bm25::idf, Bm25StatisticsProvider};
 
 /// The QueryDocumentTree
 ///
+#[derive(Debug)]
 pub enum QueryDocumentTree {
     /// Conjunction
     Conjunction(Vec<QueryDocumentTree>),
